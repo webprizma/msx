@@ -210,6 +210,15 @@ app.get('/api/msx/start.json', (req, res) => {
   res.json(currentMsxPlaylist);
 });
 
+// Official MSX default query endpoint when typing only IP/host into TV (NO SLASHES NEEDED!)
+app.get('/msx/start.json', (req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.json(currentMsxPlaylist);
+});
+
 // Simple alias endpoint for start parameter (e.g. /start.json or /msx.json)
 app.get('/start.json', (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -267,6 +276,21 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
+    // In production, if MSX or client requests JSON on root, return currentMsxPlaylist
+    app.get('/', (req, res, next) => {
+      const ua = (req.headers['user-agent'] || '').toLowerCase();
+      const accept = (req.headers['accept'] || '').toLowerCase();
+      const isMsx = ua.includes('msx') || ua.includes('mediastationx') || ua.includes('smarttv') || ua.includes('hbbtv');
+      const wantsJson = accept.includes('application/json') && !accept.includes('text/html');
+
+      if (isMsx || wantsJson) {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        return res.json(currentMsxPlaylist);
+      }
+      next();
+    });
+
     // In production, serve built dist files
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
@@ -277,8 +301,21 @@ async function startServer() {
 
   app.listen(port, '0.0.0.0', () => {
     console.log(`MSX Home Server running on http://0.0.0.0:${port}`);
-    console.log(`MSX Endpoint: http://0.0.0.0:${port}/api/msx/start.json`);
+    console.log(`MSX Endpoint: http://0.0.0.0:${port}/msx/start.json`);
+    console.log(`Zero-Slash TV Input: <LXC_IP>:${port}`);
   });
+
+  // In production (e.g. Proxmox LXC), also bind port 80 if available for zero-slash TV input: <LXC_IP>
+  if (process.env.NODE_ENV === 'production' && port !== 80) {
+    try {
+      const server80 = app.listen(80, '0.0.0.0', () => {
+        console.log(`[Zero-Slash Mode] Also listening on port 80! You can enter just <LXC_IP> on your TV!`);
+      });
+      server80.on('error', () => {
+        // Silently skip if port 80 is not available
+      });
+    } catch (e) {}
+  }
 }
 
 startServer();
