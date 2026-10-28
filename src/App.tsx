@@ -27,7 +27,9 @@ export default function App() {
   const isDirectTvRoute = typeof window !== 'undefined' && (
     window.location.pathname === '/tv' || 
     window.location.pathname.startsWith('/tv') || 
-    window.location.search.includes('mode=tv')
+    window.location.search.includes('mode=tv') ||
+    window.location.search.includes('tv') ||
+    (typeof navigator !== 'undefined' && /smart-tv|smarttv|tizen|webos|vidaa|hisense|netcast|hbbtv/i.test(navigator.userAgent))
   );
 
   const [activeTab, setActiveTab] = useState<string>(() => {
