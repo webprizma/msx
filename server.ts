@@ -200,43 +200,44 @@ app.use((req, res, next) => {
   next();
 });
 
-// Official MSX Start Parameter JSON Endpoint
-// Real Smart TVs connecting to Media Station X can enter this URL!
-app.get('/api/msx/start.json', (req, res) => {
+function sendJson(res: express.Response, data: any) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  res.json(currentMsxPlaylist);
-});
+  res.json(data);
+}
 
-// Official MSX default query endpoint when typing only IP/host into TV (NO SLASHES NEEDED!)
-app.get('/msx/start.json', (req, res) => {
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  res.json(currentMsxPlaylist);
-});
+// Helper: Start Object required by MSX specification (Settings -> Start Parameter)
+function getStartObject() {
+  return {
+    name: currentMsxPlaylist.name || "MSX Home Server",
+    version: currentMsxPlaylist.version || "1.0.0",
+    parameter: "menu:{PREFIX}{SERVER}/msx/menu.json"
+  };
+}
 
-// Simple alias endpoint for start parameter (e.g. /start.json or /msx.json)
-app.get('/start.json', (req, res) => {
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  res.json(currentMsxPlaylist);
-});
+// Helper: Menu Root Object loaded by MSX via the parameter
+function getMenuObject() {
+  return {
+    headline: currentMsxPlaylist.headline || "Домашний медиа-сервер",
+    background: currentMsxPlaylist.background || "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=1920&q=80",
+    menu: currentMsxPlaylist.menu || []
+  };
+}
 
-app.get('/msx.json', (req, res) => {
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  res.json(currentMsxPlaylist);
-});
+// 1. Start Object Endpoints (MSX setup entry point)
+app.get('/msx/start.json', (req, res) => sendJson(res, getStartObject()));
+app.get('/start.json', (req, res) => sendJson(res, getStartObject()));
+app.get('/api/msx/start.json', (req, res) => sendJson(res, getStartObject()));
+app.get('/msx.json', (req, res) => sendJson(res, getStartObject()));
 
-// API to get current playlist for web app
+// 2. Menu Root Object Endpoints (Fetched automatically by MSX from start parameter)
+app.get('/msx/menu.json', (req, res) => sendJson(res, getMenuObject()));
+app.get('/menu.json', (req, res) => sendJson(res, getMenuObject()));
+app.get('/api/msx/menu.json', (req, res) => sendJson(res, getMenuObject()));
+
+// 3. Full playlist endpoint for the web builder
 app.get('/api/msx/playlist', (req, res) => {
   res.json(currentMsxPlaylist);
 });
@@ -284,9 +285,7 @@ async function startServer() {
       const wantsJson = accept.includes('application/json') && !accept.includes('text/html');
 
       if (isMsx || wantsJson) {
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-        return res.json(currentMsxPlaylist);
+        return sendJson(res, getStartObject());
       }
       next();
     });
