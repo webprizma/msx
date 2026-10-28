@@ -6,11 +6,24 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_FILE = path.resolve(__dirname, 'msx-data.json');
+const IPTV_SETTINGS_FILE = path.resolve(__dirname, 'iptv-settings.json');
 
 const app = express();
 const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
 app.use(express.json());
+
+let iptvSettings = {
+  playlistUrl: 'http://rus.hls.gd/pl/19/61bbpl1xj1srq/playlist.m3u8',
+  archiveDays: 7,
+  providerType: 'ilook'
+};
+
+try {
+  if (fs.existsSync(IPTV_SETTINGS_FILE)) {
+    iptvSettings = JSON.parse(fs.readFileSync(IPTV_SETTINGS_FILE, 'utf8'));
+  }
+} catch (e) {}
 
 // In-memory default MSX playlist state
 let currentMsxPlaylist: any = {
@@ -300,6 +313,78 @@ app.post('/api/msx/reset', (req, res) => {
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// IPTV API Endpoints
+app.get('/api/iptv/settings', (req, res) => {
+  res.json(iptvSettings);
+});
+
+app.post('/api/iptv/settings', (req, res) => {
+  try {
+    iptvSettings = { ...iptvSettings, ...req.body };
+    fs.writeFileSync(IPTV_SETTINGS_FILE, JSON.stringify(iptvSettings, null, 2), 'utf8');
+    res.json({ success: true, settings: iptvSettings });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/iptv/channels', async (req, res) => {
+  const targetUrl = (req.query.url as string) || iptvSettings.playlistUrl;
+  if (!targetUrl) {
+    return res.json([]);
+  }
+
+  try {
+    const response = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+
+    if (response.ok) {
+      const text = await response.text();
+      if (text.includes('#EXTINF:')) {
+        const lines = text.split('\n');
+        const channels: any[] = [];
+        let curr: any = null;
+
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (line.startsWith('#EXTINF:')) {
+            curr = {};
+            const tvgLogoMatch = line.match(/tvg-logo="([^"]*)"/i);
+            const groupMatch = line.match(/group-title="([^"]*)"/i);
+            const catchupDaysMatch = line.match(/catchup-days="([^"]*)"/i);
+            const catchupSourceMatch = line.match(/catchup-source="([^"]*)"/i);
+            const lastComma = line.lastIndexOf(',');
+            curr.name = lastComma !== -1 ? line.substring(lastComma + 1).trim() : 'Канал';
+            curr.id = `ch-${channels.length + 1}`;
+            curr.logo = tvgLogoMatch?.[1] || '';
+            curr.group = groupMatch?.[1] || 'Общие';
+            curr.catchupDays = catchupDaysMatch ? parseInt(catchupDaysMatch[1], 10) : 7;
+            curr.catchupSource = catchupSourceMatch?.[1];
+          } else if (line.length > 0 && !line.startsWith('#') && curr) {
+            curr.streamUrl = line;
+            if (curr.name && curr.streamUrl) {
+              channels.push(curr);
+            }
+            curr = null;
+          }
+        }
+
+        if (channels.length > 0) {
+          return res.json(channels);
+        }
+      }
+    }
+  } catch (e) {
+    // Return empty array on failure so frontend falls back to sample channels
+  }
+
+  return res.json([]);
 });
 
 async function startServer() {

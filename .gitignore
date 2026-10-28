@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+msx-data.json
+iptv-settings.json
+iptv-cache/
+bun.lock

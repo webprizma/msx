@@ -11,6 +11,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, serverU
   const [copied, setCopied] = React.useState(false);
 
   const navItems = [
+    { id: 'iptv', label: 'IPTV Плеер (Архив)' },
     { id: 'builder', label: 'Конструктор' },
     { id: 'simulator', label: 'Симулятор ТВ' },
     { id: 'pitfalls', label: 'Подводные камни' },

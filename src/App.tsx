@@ -8,6 +8,7 @@ import { PitfallsGuide } from './components/PitfallsGuide';
 import { HostingTemplates } from './components/HostingTemplates';
 import { RoadmapPlan } from './components/RoadmapPlan';
 import { JsonViewer } from './components/JsonViewer';
+import { IptvPlayer } from './components/IptvPlayer';
 import {
   Tv,
   CheckCircle2,
@@ -23,7 +24,12 @@ import {
 } from 'lucide-react';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<string>('builder');
+  const [activeTab, setActiveTab] = useState<string>(() => {
+    if (typeof window !== 'undefined' && (window.location.pathname === '/tv' || window.location.pathname.startsWith('/tv'))) {
+      return 'iptv';
+    }
+    return 'builder';
+  });
   const [playlist, setPlaylist] = useState<MsxPlaylist>(INITIAL_DEFAULT_PLAYLIST);
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
@@ -175,6 +181,7 @@ export default function App() {
         {/* Mobile/Compact Secondary Tab Strip */}
         <div className="flex lg:hidden items-center gap-1.5 overflow-x-auto no-scrollbar pb-2">
           {[
+            { id: 'iptv', label: 'IPTV (Архив)' },
             { id: 'builder', label: 'Конструктор' },
             { id: 'simulator', label: 'Симулятор ТВ' },
             { id: 'pitfalls', label: 'Подводные камни' },
@@ -197,6 +204,10 @@ export default function App() {
         </div>
 
         {/* Tab Views */}
+        {activeTab === 'iptv' && (
+          <IptvPlayer onBackToMenu={() => setActiveTab('builder')} />
+        )}
+
         {activeTab === 'builder' && (
           <Builder
             playlist={playlist}
