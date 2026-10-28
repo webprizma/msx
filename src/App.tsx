@@ -24,18 +24,41 @@ import {
 } from 'lucide-react';
 
 export default function App() {
+  const isDirectTvRoute = typeof window !== 'undefined' && (
+    window.location.pathname === '/tv' || 
+    window.location.pathname.startsWith('/tv') || 
+    window.location.search.includes('mode=tv')
+  );
+
   const [activeTab, setActiveTab] = useState<string>(() => {
-    if (typeof window !== 'undefined' && (window.location.pathname === '/tv' || window.location.pathname.startsWith('/tv'))) {
-      return 'iptv';
-    }
+    if (isDirectTvRoute) return 'iptv';
     return 'builder';
   });
+  const [isTvFullscreen, setIsTvFullscreen] = useState(isDirectTvRoute);
   const [playlist, setPlaylist] = useState<MsxPlaylist>(INITIAL_DEFAULT_PLAYLIST);
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [serverUrl, setServerUrl] = useState('');
   const [isCopied, setIsCopied] = useState(false);
   const [isServerHealthy, setIsServerHealthy] = useState<boolean | null>(null);
+
+  // If directly opened as TV app (/tv or full-screen mode), render clean video view with ZERO headers, banners or scrollbars
+  if (isTvFullscreen) {
+    return (
+      <div className="fixed inset-0 w-screen h-screen bg-black overflow-hidden z-50">
+        <IptvPlayer
+          isTvMode={true}
+          onBackToMenu={() => {
+            if (isDirectTvRoute) {
+              window.location.href = '/';
+            } else {
+              setIsTvFullscreen(false);
+            }
+          }}
+        />
+      </div>
+    );
+  }
 
   // Helper to ensure each menu and item has a unique ID (MSX standard JSON doesn't require id)
   const normalizePlaylist = (raw: any): MsxPlaylist => {
@@ -205,7 +228,11 @@ export default function App() {
 
         {/* Tab Views */}
         {activeTab === 'iptv' && (
-          <IptvPlayer onBackToMenu={() => setActiveTab('builder')} />
+          <IptvPlayer
+            isTvMode={false}
+            onEnterTvMode={() => setIsTvFullscreen(true)}
+            onBackToMenu={() => setActiveTab('builder')}
+          />
         )}
 
         {activeTab === 'builder' && (
