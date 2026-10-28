@@ -79,11 +79,15 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   // Settings
   const [settings, setSettings] = useState<IptvSettings>({
     playlistUrl: 'http://rus.hls.gd/pl/19/61bbpl1xj1srq/playlist.m3u8',
+    epgUrl: 'https://rus.epg.team/7.1.xml?pkg=442',
     archiveDays: 7,
-    providerType: 'ilook'
+    providerType: 'tvteam'
   });
   const [inputUrl, setInputUrl] = useState(settings.playlistUrl);
+  const [inputEpgUrl, setInputEpgUrl] = useState(settings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442');
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [isSyncingEpg, setIsSyncingEpg] = useState(false);
+  const [isLoadingEpg, setIsLoadingEpg] = useState(false);
 
   // Auto-hide bottom hint after 3 seconds of inactivity
   const pokeBottomHint = useCallback(() => {
@@ -101,12 +105,19 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     };
   }, [pokeBottomHint]);
 
-  // Show a temporary toast (e.g. for future programs)
-  const showToast = (msg: string) => {
+  // Show a temporary toast (e.g. for future programs or status notices)
+  const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
-    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
-    toastTimeoutRef.current = setTimeout(() => setToastMessage(null), 2500);
-  };
+  }, []);
+
+  // Guarantee that any toast notification unconditionally hides after 2.8 seconds
+  useEffect(() => {
+    if (!toastMessage) return;
+    const timer = setTimeout(() => {
+      setToastMessage(null);
+    }, 2800);
+    return () => clearTimeout(timer);
+  }, [toastMessage]);
 
   // Format helpers
   const formatTime = (ms: number) => {
@@ -137,6 +148,18 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     });
   }, [channels, activeGroup, searchQuery]);
 
+  // VIRTUALIZED CHANNEL LIST: Only render 36 visible items around focusedChannelIndex to eliminate 3s freeze
+  const CHANNEL_ITEM_HEIGHT = 62;
+  const CHANNEL_WINDOW_SIZE = 36;
+  const channelStartIndex = Math.max(0, focusedChannelIndex - Math.floor(CHANNEL_WINDOW_SIZE / 2));
+  const channelEndIndex = Math.min(filteredChannels.length, channelStartIndex + CHANNEL_WINDOW_SIZE);
+  const visibleChannels = useMemo(() => {
+    return filteredChannels.slice(channelStartIndex, channelEndIndex).map((ch, i) => ({
+      channel: ch,
+      actualIndex: channelStartIndex + i
+    }));
+  }, [filteredChannels, channelStartIndex, channelEndIndex]);
+
   // Filter EPG by selected day (0 = today, -1 = yesterday, etc.)
   const filteredEpg = useMemo(() => {
     const targetDate = new Date();
@@ -145,7 +168,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     const dayStart = targetDate.getTime();
     const dayEnd = dayStart + 24 * 60 * 60 * 1000;
 
-    return epgList.filter(p => p.start >= dayStart && p.start < dayEnd);
+    // Show any program that overlaps with this day
+    return epgList.filter(p => p.end > dayStart && p.start < dayEnd);
   }, [epgList, selectedDayOffset]);
 
   // Load settings on mount
@@ -153,9 +177,14 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     fetch('/api/iptv/settings')
       .then(res => res.ok ? res.json() : null)
       .then(data => {
-        if (data && data.playlistUrl) {
-          setSettings(data);
-          setInputUrl(data.playlistUrl);
+        if (data) {
+          if (data.playlistUrl) {
+            setSettings(prev => ({ ...prev, ...data }));
+            setInputUrl(data.playlistUrl);
+          }
+          if (data.epgUrl) {
+            setInputEpgUrl(data.epgUrl);
+          }
         }
       })
       .catch(() => {});
@@ -205,17 +234,64 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
     loadChannels(settings.playlistUrl);
   }, [loadChannels, settings.playlistUrl]);
 
-  // Whenever selectedChannel changes, regenerate UNIQUE EPG for that channel and update bottom metadata
+  // Whenever selectedChannel changes, fetch REAL EPG from backend (with sample EPG fallback)
   useEffect(() => {
     if (!selectedChannel) return;
-    const generated = generateSample7DayEpg(selectedChannel);
-    setEpgList(generated);
+    let isCancelled = false;
+    setIsLoadingEpg(true);
 
-    const nowProg = generated.find(p => p.isLive) || generated[0];
-    setCurrentPlayingProgram(nowProg);
-    setActiveTimelineProgram(nowProg);
-    setSeekTimestamp(Date.now());
-    setIsArchiveMode(false);
+    const tvgId = selectedChannel.tvgId || '';
+    const name = selectedChannel.name || '';
+
+    fetch(`/api/iptv/epg?channelId=${encodeURIComponent(tvgId)}&name=${encodeURIComponent(name)}`)
+      .then(res => (res.ok ? res.json() : []))
+      .then((realPrograms: EpgProgram[]) => {
+        if (isCancelled) return;
+        const now = Date.now();
+
+        if (Array.isArray(realPrograms) && realPrograms.length > 0) {
+          // Re-evaluate isLive and hasArchive with current client timestamp
+          const programs = realPrograms.map(p => ({
+            ...p,
+            isLive: now >= p.start && now < p.end,
+            hasArchive: p.end <= now
+          }));
+          setEpgList(programs);
+
+          const liveProg = programs.find(p => p.isLive) || programs.find(p => p.end <= now) || programs[0];
+          setCurrentPlayingProgram(liveProg);
+          setActiveTimelineProgram(liveProg);
+          setSeekTimestamp(now);
+          setIsArchiveMode(false);
+        } else {
+          // Fallback to sample generated schedule
+          const generated = generateSample7DayEpg(selectedChannel);
+          setEpgList(generated);
+
+          const nowProg = generated.find(p => p.isLive) || generated[0];
+          setCurrentPlayingProgram(nowProg);
+          setActiveTimelineProgram(nowProg);
+          setSeekTimestamp(now);
+          setIsArchiveMode(false);
+        }
+      })
+      .catch(() => {
+        if (isCancelled) return;
+        const generated = generateSample7DayEpg(selectedChannel);
+        setEpgList(generated);
+        const nowProg = generated.find(p => p.isLive) || generated[0];
+        setCurrentPlayingProgram(nowProg);
+        setActiveTimelineProgram(nowProg);
+        setSeekTimestamp(Date.now());
+        setIsArchiveMode(false);
+      })
+      .finally(() => {
+        if (!isCancelled) setIsLoadingEpg(false);
+      });
+
+    return () => {
+      isCancelled = true;
+    };
   }, [selectedChannel]);
 
   // SMART AUTO-SCROLL FOR CHANNELS (Maintains focus in middle, stops at ends)
@@ -247,6 +323,20 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
       container.scrollTo({ top: Math.max(0, targetScroll), behavior: 'smooth' });
     }
   }, [focusedProgramIndex, overlayMode]);
+
+  // Automatically focus on the current live program (or nearest broadcast) when opening EPG
+  useEffect(() => {
+    if (overlayMode === 'epg' && filteredEpg.length > 0) {
+      const liveIdx = filteredEpg.findIndex(p => p.isLive);
+      if (liveIdx !== -1) {
+        setFocusedProgramIndex(liveIdx);
+      } else {
+        const now = Date.now();
+        const nearestIdx = filteredEpg.findIndex(p => p.end > now);
+        setFocusedProgramIndex(nearestIdx !== -1 ? nearestIdx : Math.max(0, filteredEpg.length - 1));
+      }
+    }
+  }, [overlayMode, selectedChannel?.id, selectedDayOffset, filteredEpg.length]);
 
   // Stream Playback Handler with HLS.js
   const playStream = useCallback((streamUrl: string) => {
@@ -386,7 +476,11 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
     e.preventDefault();
     setIsSavingSettings(true);
     try {
-      const newSettings = { ...settings, playlistUrl: inputUrl };
+      const newSettings: IptvSettings = {
+        ...settings,
+        playlistUrl: inputUrl,
+        epgUrl: inputEpgUrl
+      };
       await fetch('/api/iptv/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -394,11 +488,46 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
       });
       setSettings(newSettings);
       setOverlayMode('none');
+      showToast('Настройки сохранены!');
       loadChannels(inputUrl);
-    } catch (e) {
-      alert('Ошибка при сохранении настроек');
+    } catch (e: any) {
+      showToast('Ошибка при сохранении настроек');
     } finally {
       setIsSavingSettings(false);
+    }
+  };
+
+  // Manual EPG Sync handler
+  const handleSyncEpg = async () => {
+    setIsSyncingEpg(true);
+    showToast('Синхронизация EPG запущена...');
+    try {
+      const res = await fetch('/api/iptv/epg/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ epgUrl: inputEpgUrl })
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast(data.message || 'Телепрограмма успешно загружена!');
+        // Refresh EPG for currently selected channel
+        if (selectedChannel) {
+          const epgRes = await fetch(`/api/iptv/epg?channelId=${encodeURIComponent(selectedChannel.tvgId || '')}&name=${encodeURIComponent(selectedChannel.name)}`);
+          if (epgRes.ok) {
+            const list = await epgRes.json();
+            if (Array.isArray(list) && list.length > 0) {
+              const now = Date.now();
+              setEpgList(list.map(p => ({ ...p, isLive: now >= p.start && now < p.end, hasArchive: p.end <= now })));
+            }
+          }
+        }
+      } else {
+        showToast(data.message || 'Ошибка обновления EPG');
+      }
+    } catch (e: any) {
+      showToast(`Ошибка сети: ${e.message}`);
+    } finally {
+      setIsSyncingEpg(false);
     }
   };
 
@@ -1012,109 +1141,121 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             ))}
           </div>
 
-          {/* Channel Items List with Smart Centered Auto-Scroll */}
+          {/* Channel Items List: High-Performance Virtualized Windowed Renderer */}
           <div
             ref={channelListRef}
             style={{
               flex: 1,
               overflowY: 'auto',
-              padding: '12px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '6px'
+              position: 'relative',
+              padding: 0
             }}
           >
-            {filteredChannels.map((channel, idx) => {
-              const isSelected = selectedChannel?.id === channel.id;
-              const isFocused = focusedChannelIndex === idx;
+            <div
+              style={{
+                height: `${filteredChannels.length * CHANNEL_ITEM_HEIGHT}px`,
+                position: 'relative',
+                width: '100%'
+              }}
+            >
+              {visibleChannels.map(({ channel, actualIndex }) => {
+                const isSelected = selectedChannel?.id === channel.id;
+                const isFocused = focusedChannelIndex === actualIndex;
 
-              return (
-                <div
-                  key={channel.id}
-                  id={`ch-item-${idx}`}
-                  onClick={() => {
-                    setSelectedChannel(channel);
-                    setFocusedChannelIndex(idx);
-                    setOverlayMode('epg');
-                  }}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '12px',
-                    padding: '10px 14px',
-                    borderRadius: '10px',
-                    cursor: 'pointer',
-                    backgroundColor: isFocused
-                      ? '#0284c7'
-                      : isSelected
-                      ? 'rgba(30, 41, 59, 0.9)'
-                      : 'rgba(17, 24, 39, 0.6)',
-                    color: '#ffffff',
-                    border: isFocused
-                      ? '3px solid #38bdf8'
-                      : isSelected
-                      ? '1px solid rgba(56, 189, 248, 0.5)'
-                      : '1px solid transparent',
-                    boxShadow: isFocused ? '0 0 15px rgba(56, 189, 248, 0.5)' : 'none'
-                  }}
-                >
-                  <span style={{ width: '24px', textAlign: 'center', fontSize: '12px', color: isFocused ? '#ffffff' : '#64748b', fontFamily: 'monospace' }}>
-                    {idx + 1}
-                  </span>
-
+                return (
                   <div
+                    key={channel.id || actualIndex}
+                    id={`ch-item-${actualIndex}`}
+                    onClick={() => {
+                      setSelectedChannel(channel);
+                      setFocusedChannelIndex(actualIndex);
+                      setOverlayMode('epg');
+                    }}
                     style={{
-                      width: '40px',
-                      height: '40px',
-                      borderRadius: '8px',
-                      backgroundColor: '#0f172a',
-                      border: '1px solid rgba(51, 65, 85, 0.8)',
+                      position: 'absolute',
+                      top: `${actualIndex * CHANNEL_ITEM_HEIGHT + 4}px`,
+                      left: '12px',
+                      right: '12px',
+                      height: `${CHANNEL_ITEM_HEIGHT - 6}px`,
+                      boxSizing: 'border-box',
                       display: 'flex',
                       alignItems: 'center',
-                      justifyContent: 'center',
-                      overflow: 'hidden',
-                      flexShrink: 0
+                      gap: '12px',
+                      padding: '8px 14px',
+                      borderRadius: '10px',
+                      cursor: 'pointer',
+                      backgroundColor: isFocused
+                        ? '#0284c7'
+                        : isSelected
+                        ? 'rgba(30, 41, 59, 0.9)'
+                        : 'rgba(17, 24, 39, 0.6)',
+                      color: '#ffffff',
+                      border: isFocused
+                        ? '3px solid #38bdf8'
+                        : isSelected
+                        ? '1px solid rgba(56, 189, 248, 0.5)'
+                        : '1px solid transparent',
+                      boxShadow: isFocused ? '0 0 15px rgba(56, 189, 248, 0.5)' : 'none'
                     }}
                   >
-                    {channel.logo ? (
-                      <img
-                        src={channel.logo}
-                        alt={channel.name}
-                        style={{ width: '100%', height: '100%', objectFit: 'contain', padding: '2px' }}
-                        onError={(e) => {
-                          (e.target as HTMLElement).style.display = 'none';
-                        }}
-                      />
-                    ) : (
-                      <Tv style={{ width: '20px', height: '20px', color: '#94a3b8' }} />
-                    )}
-                  </div>
+                    <span style={{ width: '28px', textAlign: 'center', fontSize: '12px', color: isFocused ? '#ffffff' : '#64748b', fontFamily: 'monospace' }}>
+                      {actualIndex + 1}
+                    </span>
 
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <p style={{ fontSize: '13px', fontWeight: 'bold', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {channel.name}
-                    </p>
-                    <p style={{ fontSize: '11px', color: isFocused ? '#bae6fd' : '#94a3b8', margin: '2px 0 0 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {channel.group || 'Общие'}
-                    </p>
-                  </div>
+                    <div
+                      style={{
+                        width: '38px',
+                        height: '38px',
+                        borderRadius: '8px',
+                        backgroundColor: '#0f172a',
+                        border: '1px solid rgba(51, 65, 85, 0.8)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        overflow: 'hidden',
+                        flexShrink: 0
+                      }}
+                    >
+                      {channel.logo ? (
+                        <img
+                          src={channel.logo}
+                          alt={channel.name}
+                          style={{ width: '100%', height: '100%', objectFit: 'contain', padding: '2px' }}
+                          onError={(e) => {
+                            (e.target as HTMLElement).style.display = 'none';
+                          }}
+                        />
+                      ) : (
+                        <Tv style={{ width: '20px', height: '20px', color: '#94a3b8' }} />
+                      )}
+                    </div>
 
-                  <span
-                    style={{
-                      fontSize: '10px',
-                      fontWeight: 'bold',
-                      padding: '2px 6px',
-                      borderRadius: '8px',
-                      backgroundColor: 'rgba(245, 158, 11, 0.25)',
-                      color: '#fbbf24',
-                      border: '1px solid rgba(245, 158, 11, 0.4)'
-                    }}
-                  >
-                    7д
-                  </span>
-                </div>
-              );
-            })}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <p style={{ fontSize: '13px', fontWeight: 'bold', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {channel.name}
+                      </p>
+                      <p style={{ fontSize: '11px', color: isFocused ? '#bae6fd' : '#94a3b8', margin: '2px 0 0 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {channel.group || 'Общие'}
+                      </p>
+                    </div>
+
+                    <span
+                      style={{
+                        fontSize: '10px',
+                        fontWeight: 'bold',
+                        padding: '2px 6px',
+                        borderRadius: '8px',
+                        backgroundColor: 'rgba(245, 158, 11, 0.25)',
+                        color: '#fbbf24',
+                        border: '1px solid rgba(245, 158, 11, 0.4)'
+                      }}
+                    >
+                      7д
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
 
           {/* Footer Hints */}
@@ -1257,111 +1398,125 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
               gap: '6px'
             }}
           >
-            {filteredEpg.map((prog, idx) => {
-              const isFocused = focusedProgramIndex === idx;
-              const isCurrentLive = prog.isLive;
-              const isFuture = prog.start > Date.now();
+            {isLoadingEpg ? (
+              <div style={{ padding: '36px 16px', textAlign: 'center', color: '#94a3b8', fontSize: '13px' }}>
+                <Clock style={{ width: '28px', height: '28px', margin: '0 auto 10px auto', color: '#38bdf8' }} />
+                <p style={{ margin: 0, fontWeight: 'bold', color: '#bae6fd' }}>Загрузка телегида...</p>
+                <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#64748b' }}>Получение программы передач</p>
+              </div>
+            ) : filteredEpg.length === 0 ? (
+              <div style={{ padding: '36px 16px', textAlign: 'center', color: '#94a3b8', fontSize: '13px' }}>
+                <Calendar style={{ width: '28px', height: '28px', margin: '0 auto 10px auto', color: '#64748b' }} />
+                <p style={{ margin: 0, fontWeight: 'bold' }}>Нет программы на выбранный день</p>
+                <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#64748b' }}>Используйте ◄ ► для выбора другого дня</p>
+              </div>
+            ) : (
+              filteredEpg.map((prog, idx) => {
+                const isFocused = focusedProgramIndex === idx;
+                const isCurrentLive = prog.isLive;
+                const isFuture = prog.start > Date.now();
 
-              return (
-                <div
-                  key={prog.id}
-                  id={`epg-item-${idx}`}
-                  onClick={() => {
-                    setFocusedProgramIndex(idx);
-                    if (isFuture) {
-                      showToast('Передача ещё не началась (Анонс)');
-                      return;
-                    }
-                    if (prog.isLive) {
-                      setPromptProgram(prog);
-                      setPromptFocusedChoice('live');
-                      setOverlayMode('prompt');
-                    } else {
-                      handlePlayArchiveProgram(prog, true);
-                    }
-                  }}
-                  style={{
-                    padding: '10px 14px',
-                    borderRadius: '10px',
-                    cursor: isFuture ? 'not-allowed' : 'pointer',
-                    backgroundColor: isFocused
-                      ? '#0284c7'
-                      : isCurrentLive
-                      ? 'rgba(12, 74, 110, 0.6)'
-                      : isFuture
-                      ? 'rgba(15, 23, 42, 0.4)'
-                      : 'rgba(17, 24, 39, 0.6)',
-                    color: isFuture && !isFocused ? '#64748b' : '#ffffff',
-                    border: isFocused
-                      ? '3px solid #38bdf8'
-                      : isCurrentLive
-                      ? '1px solid rgba(56, 189, 248, 0.6)'
-                      : '1px solid rgba(51, 65, 85, 0.5)',
-                    boxShadow: isFocused ? '0 0 15px rgba(56, 189, 248, 0.5)' : 'none',
-                    opacity: isFuture && !isFocused ? 0.65 : 1.0
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-                    <span style={{ fontSize: '11px', fontFamily: 'monospace', fontWeight: 'bold', color: isFocused ? '#ffffff' : isFuture ? '#64748b' : '#38bdf8' }}>
-                      {formatTime(prog.start)} — {formatTime(prog.end)}
-                    </span>
+                return (
+                  <div
+                    key={prog.id}
+                    id={`epg-item-${idx}`}
+                    onClick={() => {
+                      setFocusedProgramIndex(idx);
+                      if (isFuture) {
+                        showToast('Передача ещё не началась (Анонс)');
+                        return;
+                      }
+                      if (prog.isLive) {
+                        setPromptProgram(prog);
+                        setPromptFocusedChoice('live');
+                        setOverlayMode('prompt');
+                      } else {
+                        handlePlayArchiveProgram(prog, true);
+                      }
+                    }}
+                    style={{
+                      padding: '10px 14px',
+                      borderRadius: '10px',
+                      cursor: isFuture ? 'not-allowed' : 'pointer',
+                      backgroundColor: isFocused
+                        ? '#0284c7'
+                        : isCurrentLive
+                        ? 'rgba(12, 74, 110, 0.6)'
+                        : isFuture
+                        ? 'rgba(15, 23, 42, 0.4)'
+                        : 'rgba(17, 24, 39, 0.6)',
+                      color: isFuture && !isFocused ? '#64748b' : '#ffffff',
+                      border: isFocused
+                        ? '3px solid #38bdf8'
+                        : isCurrentLive
+                        ? '1px solid rgba(56, 189, 248, 0.6)'
+                        : '1px solid rgba(51, 65, 85, 0.5)',
+                      boxShadow: isFocused ? '0 0 15px rgba(56, 189, 248, 0.5)' : 'none',
+                      opacity: isFuture && !isFocused ? 0.65 : 1.0
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+                      <span style={{ fontSize: '11px', fontFamily: 'monospace', fontWeight: 'bold', color: isFocused ? '#ffffff' : isFuture ? '#64748b' : '#38bdf8' }}>
+                        {formatTime(prog.start)} — {formatTime(prog.end)}
+                      </span>
 
-                    {prog.isLive ? (
-                      <span
-                        style={{
-                          fontSize: '10px',
-                          fontWeight: 'bold',
-                          padding: '2px 6px',
-                          borderRadius: '8px',
-                          backgroundColor: 'rgba(239, 68, 68, 0.3)',
-                          color: '#f87171',
-                          border: '1px solid rgba(239, 68, 68, 0.5)'
-                        }}
-                      >
-                        ● ЭФИР
-                      </span>
-                    ) : isFuture ? (
-                      <span
-                        style={{
-                          fontSize: '10px',
-                          fontWeight: 'bold',
-                          padding: '2px 6px',
-                          borderRadius: '8px',
-                          backgroundColor: 'rgba(71, 85, 105, 0.3)',
-                          color: '#94a3b8'
-                        }}
-                      >
-                        СКОРО
-                      </span>
-                    ) : prog.hasArchive ? (
-                      <span
-                        style={{
-                          fontSize: '10px',
-                          fontWeight: 'bold',
-                          padding: '2px 6px',
-                          borderRadius: '8px',
-                          backgroundColor: 'rgba(245, 158, 11, 0.25)',
-                          color: '#fbbf24',
-                          border: '1px solid rgba(245, 158, 11, 0.4)'
-                        }}
-                      >
-                        АРХИВ
-                      </span>
-                    ) : null}
+                      {prog.isLive ? (
+                        <span
+                          style={{
+                            fontSize: '10px',
+                            fontWeight: 'bold',
+                            padding: '2px 6px',
+                            borderRadius: '8px',
+                            backgroundColor: 'rgba(239, 68, 68, 0.3)',
+                            color: '#f87171',
+                            border: '1px solid rgba(239, 68, 68, 0.5)'
+                          }}
+                        >
+                          ● ЭФИР
+                        </span>
+                      ) : isFuture ? (
+                        <span
+                          style={{
+                            fontSize: '10px',
+                            fontWeight: 'bold',
+                            padding: '2px 6px',
+                            borderRadius: '8px',
+                            backgroundColor: 'rgba(71, 85, 105, 0.3)',
+                            color: '#94a3b8'
+                          }}
+                        >
+                          СКОРО
+                        </span>
+                      ) : prog.hasArchive ? (
+                        <span
+                          style={{
+                            fontSize: '10px',
+                            fontWeight: 'bold',
+                            padding: '2px 6px',
+                            borderRadius: '8px',
+                            backgroundColor: 'rgba(245, 158, 11, 0.25)',
+                            color: '#fbbf24',
+                            border: '1px solid rgba(245, 158, 11, 0.4)'
+                          }}
+                        >
+                          АРХИВ
+                        </span>
+                      ) : null}
+                    </div>
+
+                    <h3 style={{ fontSize: '13px', fontWeight: 'bold', margin: '0 0 3px 0', lineHeight: 1.3 }}>
+                      {prog.title}
+                    </h3>
+
+                    {prog.description && (
+                      <p style={{ fontSize: '11px', color: isFocused ? '#bae6fd' : '#94a3b8', margin: 0, lineHeight: 1.3, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                        {prog.description}
+                      </p>
+                    )}
                   </div>
-
-                  <h3 style={{ fontSize: '13px', fontWeight: 'bold', margin: '0 0 3px 0', lineHeight: 1.3 }}>
-                    {prog.title}
-                  </h3>
-
-                  {prog.description && (
-                    <p style={{ fontSize: '11px', color: isFocused ? '#bae6fd' : '#94a3b8', margin: 0, lineHeight: 1.3, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
-                      {prog.description}
-                    </p>
-                  )}
-                </div>
-              );
-            })}
+                );
+              })
+            )}
           </div>
 
           {/* Footer Hints */}
@@ -1730,6 +1885,53 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                     boxSizing: 'border-box'
                   }}
                 />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', color: '#cbd5e1', fontSize: '12px', fontWeight: 'bold', marginBottom: '6px' }}>
+                  Ссылка на телегид EPG (XMLTV):
+                </label>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <input
+                    type="text"
+                    value={inputEpgUrl}
+                    onChange={(e) => setInputEpgUrl(e.target.value)}
+                    placeholder="https://rus.epg.team/7.1.xml?pkg=442"
+                    style={{
+                      flex: 1,
+                      padding: '10px 14px',
+                      borderRadius: '8px',
+                      backgroundColor: '#020617',
+                      border: '1px solid #334155',
+                      color: '#ffffff',
+                      fontFamily: 'monospace',
+                      fontSize: '12px',
+                      outline: 'none',
+                      boxSizing: 'border-box'
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSyncEpg}
+                    disabled={isSyncingEpg}
+                    style={{
+                      padding: '10px 14px',
+                      borderRadius: '8px',
+                      backgroundColor: isSyncingEpg ? '#334155' : 'rgba(56, 189, 248, 0.2)',
+                      border: '1px solid rgba(56, 189, 248, 0.4)',
+                      color: '#38bdf8',
+                      fontSize: '11px',
+                      fontWeight: 'bold',
+                      cursor: isSyncingEpg ? 'not-allowed' : 'pointer',
+                      whiteSpace: 'nowrap'
+                    }}
+                  >
+                    {isSyncingEpg ? 'Загрузка...' : 'Обновить EPG'}
+                  </button>
+                </div>
+                <p style={{ fontSize: '11px', color: '#64748b', margin: '4px 0 0 0' }}>
+                  TV.Team 7 дней архива: <span style={{ color: '#94a3b8', fontFamily: 'monospace' }}>https://rus.epg.team/7.1.xml?pkg=442</span>
+                </p>
               </div>
 
               <div>

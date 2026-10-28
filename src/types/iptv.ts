@@ -5,6 +5,7 @@ export interface Channel {
   group: string;
   streamUrl: string;
   tvgId?: string;
+  tvgName?: string;
   catchupDays: number;
   catchupSource?: string;
   catchupType?: string;

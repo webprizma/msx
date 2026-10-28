@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { initEpgCache, syncEpg, getChannelEpg } from './src/utils/epgService';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,15 +16,22 @@ app.use(express.json());
 
 let iptvSettings = {
   playlistUrl: 'http://rus.hls.gd/pl/19/61bbpl1xj1srq/playlist.m3u8',
+  epgUrl: 'https://rus.epg.team/7.1.xml?pkg=442',
   archiveDays: 7,
-  providerType: 'ilook'
+  providerType: 'tvteam'
 };
 
 try {
   if (fs.existsSync(IPTV_SETTINGS_FILE)) {
-    iptvSettings = JSON.parse(fs.readFileSync(IPTV_SETTINGS_FILE, 'utf8'));
+    iptvSettings = { ...iptvSettings, ...JSON.parse(fs.readFileSync(IPTV_SETTINGS_FILE, 'utf8')) };
   }
 } catch (e) {}
+
+// Initialize disk-cached EPG & trigger background sync
+initEpgCache();
+syncEpg(iptvSettings.epgUrl || 'https://rus.epg.team/1.1.xml').catch(err => {
+  console.warn('[EPG Background Sync Notice]:', err?.message || err);
+});
 
 // In-memory default MSX playlist state
 let currentMsxPlaylist: any = {
@@ -316,17 +324,44 @@ app.get('/api/health', (req, res) => {
 });
 
 // IPTV API Endpoints
+// IPTV API Endpoints
 app.get('/api/iptv/settings', (req, res) => {
   res.json(iptvSettings);
 });
 
-app.post('/api/iptv/settings', (req, res) => {
+app.post('/api/iptv/settings', async (req, res) => {
   try {
+    const oldEpgUrl = iptvSettings.epgUrl;
     iptvSettings = { ...iptvSettings, ...req.body };
     fs.writeFileSync(IPTV_SETTINGS_FILE, JSON.stringify(iptvSettings, null, 2), 'utf8');
+
+    // If EPG URL was changed, trigger re-sync in background
+    if (req.body.epgUrl && req.body.epgUrl !== oldEpgUrl) {
+      syncEpg(req.body.epgUrl).catch(e => console.error('[EPG Sync Error]', e));
+    }
+
     res.json({ success: true, settings: iptvSettings });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Real EPG endpoint for TV channels
+app.get('/api/iptv/epg', (req, res) => {
+  const channelId = (req.query.channelId as string) || (req.query.tvgId as string) || '';
+  const name = (req.query.name as string) || '';
+  const programs = getChannelEpg(channelId, name);
+  res.json(programs);
+});
+
+// Trigger manual EPG sync
+app.post('/api/iptv/epg/sync', async (req, res) => {
+  const targetEpgUrl = req.body?.epgUrl || iptvSettings.epgUrl || 'https://rus.epg.team/1.1.xml';
+  try {
+    const result = await syncEpg(targetEpgUrl);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -355,6 +390,8 @@ app.get('/api/iptv/channels', async (req, res) => {
           const line = lines[i].trim();
           if (line.startsWith('#EXTINF:')) {
             curr = {};
+            const tvgIdMatch = line.match(/tvg-id="([^"]*)"/i);
+            const tvgNameMatch = line.match(/tvg-name="([^"]*)"/i);
             const tvgLogoMatch = line.match(/tvg-logo="([^"]*)"/i);
             const groupMatch = line.match(/group-title="([^"]*)"/i);
             const catchupDaysMatch = line.match(/catchup-days="([^"]*)"/i);
@@ -362,6 +399,8 @@ app.get('/api/iptv/channels', async (req, res) => {
             const lastComma = line.lastIndexOf(',');
             curr.name = lastComma !== -1 ? line.substring(lastComma + 1).trim() : 'Канал';
             curr.id = `ch-${channels.length + 1}`;
+            curr.tvgId = tvgIdMatch?.[1] || '';
+            curr.tvgName = tvgNameMatch?.[1] || '';
             curr.logo = tvgLogoMatch?.[1] || '';
             curr.group = groupMatch?.[1] || 'Общие';
             curr.catchupDays = catchupDaysMatch ? parseInt(catchupDaysMatch[1], 10) : 7;
