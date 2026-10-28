@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  msx-server:
+    build: .
+    container_name: msx-home-server
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production

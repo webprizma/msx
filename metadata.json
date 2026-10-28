@@ -1,0 +1,6 @@
+{
+  "name": "MSX Home Server Station",
+  "description": "Интерактивный конструктор, эмулятор и руководство по созданию домашнего сервера для Media Station X (Smart TV).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
