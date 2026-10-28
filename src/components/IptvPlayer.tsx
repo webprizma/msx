@@ -19,7 +19,7 @@ import {
   AlertCircle,
   X,
   ArrowLeft,
-  Maximize2
+  Info
 } from 'lucide-react';
 
 interface IptvPlayerProps {
@@ -37,17 +37,18 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const channelListRef = useRef<HTMLDivElement | null>(null);
+  const epgListRef = useRef<HTMLDivElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+
   const timelineHideTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const seekDebounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const hudTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const bottomHintTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const toastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // UI Scale control for Smart TVs (0.75, 0.85, 1.0, 1.15)
-  const [uiScale, setUiScale] = useState<number>(() => {
-    if (typeof window !== 'undefined' && window.innerWidth < 1400) return 0.85;
-    return 1.0;
-  });
-  const [remoteDebugKey, setRemoteDebugKey] = useState<string | null>(null);
+  // Bottom hint visibility (auto-hides after 3 seconds)
+  const [showBottomHint, setShowBottomHint] = useState<boolean>(true);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Channels & EPG state
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -83,6 +84,29 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   });
   const [inputUrl, setInputUrl] = useState(settings.playlistUrl);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+
+  // Auto-hide bottom hint after 3 seconds of inactivity
+  const pokeBottomHint = useCallback(() => {
+    setShowBottomHint(true);
+    if (bottomHintTimerRef.current) clearTimeout(bottomHintTimerRef.current);
+    bottomHintTimerRef.current = setTimeout(() => {
+      setShowBottomHint(false);
+    }, 3000);
+  }, []);
+
+  useEffect(() => {
+    pokeBottomHint();
+    return () => {
+      if (bottomHintTimerRef.current) clearTimeout(bottomHintTimerRef.current);
+    };
+  }, [pokeBottomHint]);
+
+  // Show a temporary toast (e.g. for future programs)
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+    toastTimeoutRef.current = setTimeout(() => setToastMessage(null), 2500);
+  };
 
   // Format helpers
   const formatTime = (ms: number) => {
@@ -194,6 +218,36 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
     setIsArchiveMode(false);
   }, [selectedChannel]);
 
+  // SMART AUTO-SCROLL FOR CHANNELS (Maintains focus in middle, stops at ends)
+  useEffect(() => {
+    if (overlayMode !== 'channels') return;
+    const container = channelListRef.current;
+    if (!container) return;
+    const itemEl = document.getElementById(`ch-item-${focusedChannelIndex}`);
+    if (itemEl) {
+      const cHeight = container.clientHeight;
+      const iTop = itemEl.offsetTop;
+      const iHeight = itemEl.clientHeight;
+      const targetScroll = iTop - (cHeight / 2) + (iHeight / 2);
+      container.scrollTo({ top: Math.max(0, targetScroll), behavior: 'smooth' });
+    }
+  }, [focusedChannelIndex, overlayMode]);
+
+  // SMART AUTO-SCROLL FOR EPG PROGRAMS (Maintains focus in middle, stops at ends)
+  useEffect(() => {
+    if (overlayMode !== 'epg') return;
+    const container = epgListRef.current;
+    if (!container) return;
+    const itemEl = document.getElementById(`epg-item-${focusedProgramIndex}`);
+    if (itemEl) {
+      const cHeight = container.clientHeight;
+      const iTop = itemEl.offsetTop;
+      const iHeight = itemEl.clientHeight;
+      const targetScroll = iTop - (cHeight / 2) + (iHeight / 2);
+      container.scrollTo({ top: Math.max(0, targetScroll), behavior: 'smooth' });
+    }
+  }, [focusedProgramIndex, overlayMode]);
+
   // Stream Playback Handler with HLS.js
   const playStream = useCallback((streamUrl: string) => {
     setPlayerError(null);
@@ -273,6 +327,14 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
   // Play Archive from a specific program
   const handlePlayArchiveProgram = useCallback((program: EpgProgram, fromStart = true) => {
     if (!selectedChannel) return;
+    const now = Date.now();
+
+    // Prevent selecting future programs
+    if (program.start > now) {
+      showToast('Передача ещё не началась (Анонс)');
+      return;
+    }
+
     const startSec = Math.floor(program.start / 1000);
     const endSec = Math.floor(program.end / 1000);
     const archiveUrl = buildTimestampArchiveUrl(selectedChannel, startSec, endSec);
@@ -338,13 +400,6 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
     } finally {
       setIsSavingSettings(false);
     }
-  };
-
-  // Trigger on-screen HUD for TV Remote feedback
-  const triggerRemoteHud = (actionName: string) => {
-    setRemoteDebugKey(actionName);
-    if (hudTimeoutRef.current) clearTimeout(hudTimeoutRef.current);
-    hudTimeoutRef.current = setTimeout(() => setRemoteDebugKey(null), 1800);
   };
 
   // Keep focus on root container for TV remote events
@@ -417,9 +472,12 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
         e.stopPropagation();
       }
 
-      triggerRemoteHud(action);
+      // Wake up the bottom hints on any remote action if watching video
+      if (overlayMode === 'none') {
+        pokeBottomHint();
+      }
 
-      // 1. STATE: OVERLAY 'none' (Pure Fullscreen Video)
+      // 1. STATE: OVERLAY 'none' (Watching Pure Fullscreen Video)
       if (overlayMode === 'none') {
         switch (action) {
           case 'OK':
@@ -467,13 +525,15 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             break;
 
           case 'BACK':
-            onBackToMenu?.();
+            // CRITICAL FIX: DO NOT exit to black screen when watching TV!
+            // Just display the bottom hint briefly to confirm TV is active.
+            pokeBottomHint();
             break;
         }
         return;
       }
 
-      // 2. STATE: OVERLAY 'channels' (Channel List Open)
+      // 2. STATE: OVERLAY 'channels' (Channel List Open on the Left)
       if (overlayMode === 'channels') {
         switch (action) {
           case 'UP':
@@ -518,7 +578,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
         return;
       }
 
-      // 3. STATE: OVERLAY 'epg' (Program Schedule for Channel)
+      // 3. STATE: OVERLAY 'epg' (Program Schedule on the Left)
       if (overlayMode === 'epg') {
         switch (action) {
           case 'UP':
@@ -542,6 +602,14 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
           case 'OK':
             if (filteredEpg[focusedProgramIndex]) {
               const prog = filteredEpg[focusedProgramIndex];
+              const now = Date.now();
+
+              // Prevent selecting future programs
+              if (prog.start > now) {
+                showToast('Передача ещё не началась (Анонс)');
+                break;
+              }
+
               if (prog.isLive) {
                 setPromptProgram(prog);
                 setPromptFocusedChoice('live');
@@ -553,6 +621,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             break;
 
           case 'BACK':
+            // Step back to channel list on the left!
             setOverlayMode('channels');
             break;
         }
@@ -655,7 +724,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
       document.removeEventListener('keydown', handleTvKey, true);
       if (timelineHideTimeoutRef.current) clearTimeout(timelineHideTimeoutRef.current);
       if (seekDebounceTimeoutRef.current) clearTimeout(seekDebounceTimeoutRef.current);
-      if (hudTimeoutRef.current) clearTimeout(hudTimeoutRef.current);
+      if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
     };
   }, [
     normalizeTvKey,
@@ -677,7 +746,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
     handlePlayArchiveProgram,
     handleSeekToTimestamp,
     resetTimelineAutoHide,
-    onBackToMenu
+    pokeBottomHint
   ]);
 
   // Current program timeline calculations
@@ -743,18 +812,45 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
           >
             <div
               style={{
-                width: '64px',
-                height: '64px',
+                width: '56px',
+                height: '56px',
                 borderRadius: '50%',
-                border: '5px solid rgba(56, 189, 248, 0.3)',
+                border: '4px solid rgba(56, 189, 248, 0.3)',
                 borderTopColor: '#38bdf8',
-                marginBottom: '16px',
+                marginBottom: '14px',
                 animation: 'spin 1s linear infinite'
               }}
             />
-            <p style={{ fontSize: '16px', fontWeight: 'bold', color: '#bae6fd' }}>
-              Загрузка трансляции {selectedChannel?.name ? `(${selectedChannel.name})` : ''}...
+            <p style={{ fontSize: '15px', fontWeight: 'bold', color: '#bae6fd' }}>
+              Загрузка {selectedChannel?.name ? `(${selectedChannel.name})` : ''}...
             </p>
+          </div>
+        )}
+
+        {/* Toast Notification (e.g. "Передача еще не началась") */}
+        {toastMessage && (
+          <div
+            style={{
+              position: 'absolute',
+              top: '40px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              backgroundColor: 'rgba(15, 23, 42, 0.95)',
+              border: '2px solid #38bdf8',
+              color: '#ffffff',
+              padding: '10px 24px',
+              borderRadius: '24px',
+              fontSize: '14px',
+              fontWeight: 'bold',
+              boxShadow: '0 8px 30px rgba(0,0,0,0.85)',
+              zIndex: 100,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px'
+            }}
+          >
+            <Info style={{ width: '18px', height: '18px', color: '#38bdf8' }} />
+            {toastMessage}
           </div>
         )}
 
@@ -803,62 +899,35 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
         )}
       </div>
 
-      {/* 2. GUARANTEED VISIBLE REMOTE HUD (Top Right) */}
-      {remoteDebugKey && (
+      {/* 2. AUTO-HIDING BOTTOM REMOTE HINT BAR (Hides after 3 seconds) */}
+      {overlayMode === 'none' && showBottomHint && (
         <div
           style={{
             position: 'fixed',
-            top: '20px',
-            right: '24px',
-            backgroundColor: '#0284c7',
-            color: '#ffffff',
-            border: '2px solid #ffffff',
-            borderRadius: '12px',
-            padding: '8px 18px',
-            fontSize: '16px',
-            fontWeight: 'bold',
-            zIndex: 999999,
-            boxShadow: '0 4px 25px rgba(0,0,0,0.85)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px'
-          }}
-        >
-          <span>🎮 Пульт:</span>
-          <span style={{ color: '#fef08a' }}>{remoteDebugKey}</span>
-          <span style={{ fontSize: '12px', color: '#bae6fd' }}>[{overlayMode}]</span>
-        </div>
-      )}
-
-      {/* 3. ALWAYS-VISIBLE BOTTOM REMOTE HINT BAR (Discreet 10-foot TV guidance) */}
-      {overlayMode === 'none' && (
-        <div
-          style={{
-            position: 'fixed',
-            bottom: '16px',
+            bottom: '20px',
             left: '50%',
             transform: 'translateX(-50%)',
-            backgroundColor: 'rgba(10, 15, 29, 0.88)',
+            backgroundColor: 'rgba(10, 15, 29, 0.92)',
             border: '1px solid rgba(56, 189, 248, 0.4)',
             borderRadius: '30px',
-            padding: '6px 20px',
+            padding: '8px 24px',
             display: 'flex',
             alignItems: 'center',
-            gap: '16px',
-            fontSize: '12px',
+            gap: '18px',
+            fontSize: '13px',
             color: '#cbd5e1',
             zIndex: 25,
-            boxShadow: '0 4px 20px rgba(0,0,0,0.6)'
+            boxShadow: '0 6px 25px rgba(0,0,0,0.7)',
+            transition: 'opacity 0.3s ease'
           }}
         >
           <span><b style={{ color: '#38bdf8' }}>ОК:</b> Список каналов</span>
           <span><b style={{ color: '#38bdf8' }}>▼:</b> Таймшифт & Перемотка</span>
           <span><b style={{ color: '#38bdf8' }}>◄ ►:</b> -1 мин / +1 мин</span>
-          <span><b style={{ color: '#94a3b8' }}>BACK:</b> В меню</span>
         </div>
       )}
 
-      {/* 4. CHANNELS OVERLAY DRAWER (Triggered by remote "OK") */}
+      {/* 3. CHANNELS OVERLAY DRAWER (Snappy Left-docked drawer) */}
       {overlayMode === 'channels' && (
         <div
           style={{
@@ -866,14 +935,14 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             top: 0,
             bottom: 0,
             left: 0,
-            width: '360px',
-            maxWidth: '40vw',
-            backgroundColor: 'rgba(11, 17, 33, 0.97)',
+            width: '380px',
+            maxWidth: '45vw',
+            backgroundColor: '#0b1121',
             borderRight: '2px solid rgba(56, 189, 248, 0.4)',
             display: 'flex',
             flexDirection: 'column',
             zIndex: 40,
-            boxShadow: '4px 0 30px rgba(0,0,0,0.85)'
+            boxShadow: '6px 0 35px rgba(0,0,0,0.9)'
           }}
         >
           {/* Header */}
@@ -883,16 +952,16 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
               borderBottom: '1px solid rgba(51, 65, 85, 0.8)',
               display: 'flex',
               alignItems: 'center',
-              justifyContent: 'between'
+              justifyContent: 'space-between'
             }}
           >
             <div style={{ flex: 1 }}>
-              <h2 style={{ fontSize: '17px', fontWeight: 'bold', color: '#ffffff', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <h2 style={{ fontSize: '18px', fontWeight: 'bold', color: '#ffffff', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <Radio style={{ width: '18px', height: '18px', color: '#38bdf8' }} />
                 Телеканалы
               </h2>
               <p style={{ fontSize: '11px', color: '#94a3b8', margin: '4px 0 0 0' }}>
-                {filteredChannels.length} каналов · <b style={{ color: '#38bdf8' }}>OK:</b> программа передач
+                {filteredChannels.length} каналов · <b style={{ color: '#38bdf8' }}>OK:</b> открыть передачу
               </p>
             </div>
             <button
@@ -943,8 +1012,18 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             ))}
           </div>
 
-          {/* Channel Items List */}
-          <div style={{ flex: 1, overflowY: 'auto', padding: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          {/* Channel Items List with Smart Centered Auto-Scroll */}
+          <div
+            ref={channelListRef}
+            style={{
+              flex: 1,
+              overflowY: 'auto',
+              padding: '12px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '6px'
+            }}
+          >
             {filteredChannels.map((channel, idx) => {
               const isSelected = selectedChannel?.id === channel.id;
               const isFocused = focusedChannelIndex === idx;
@@ -952,6 +1031,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
               return (
                 <div
                   key={channel.id}
+                  id={`ch-item-${idx}`}
                   onClick={() => {
                     setSelectedChannel(channel);
                     setFocusedChannelIndex(idx);
@@ -962,7 +1042,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                     alignItems: 'center',
                     gap: '12px',
                     padding: '10px 14px',
-                    borderRadius: '12px',
+                    borderRadius: '10px',
                     cursor: 'pointer',
                     backgroundColor: isFocused
                       ? '#0284c7'
@@ -975,9 +1055,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                       : isSelected
                       ? '1px solid rgba(56, 189, 248, 0.5)'
                       : '1px solid transparent',
-                    boxShadow: isFocused ? '0 0 20px rgba(56, 189, 248, 0.6)' : 'none',
-                    transform: isFocused ? 'scale(1.02)' : 'none',
-                    transition: 'all 0.15s ease'
+                    boxShadow: isFocused ? '0 0 15px rgba(56, 189, 248, 0.5)' : 'none'
                   }}
                 >
                   <span style={{ width: '24px', textAlign: 'center', fontSize: '12px', color: isFocused ? '#ffffff' : '#64748b', fontFamily: 'monospace' }}>
@@ -1025,8 +1103,8 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                     style={{
                       fontSize: '10px',
                       fontWeight: 'bold',
-                      padding: '2px 8px',
-                      borderRadius: '10px',
+                      padding: '2px 6px',
+                      borderRadius: '8px',
                       backgroundColor: 'rgba(245, 158, 11, 0.25)',
                       color: '#fbbf24',
                       border: '1px solid rgba(245, 158, 11, 0.4)'
@@ -1043,7 +1121,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
           <div
             style={{
               padding: '12px 16px',
-              backgroundColor: 'rgba(15, 23, 42, 0.95)',
+              backgroundColor: 'rgba(15, 23, 42, 0.98)',
               borderTop: '1px solid rgba(51, 65, 85, 0.8)',
               fontSize: '11px',
               color: '#94a3b8',
@@ -1057,22 +1135,22 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
         </div>
       )}
 
-      {/* 5. EPG SCHEDULE OVERLAY DRAWER (Triggered by selecting channel) */}
+      {/* 4. EPG SCHEDULE OVERLAY DRAWER (Docked to the LEFT edge!) */}
       {overlayMode === 'epg' && selectedChannel && (
         <div
           style={{
             position: 'fixed',
             top: 0,
             bottom: 0,
-            left: '360px',
-            width: '460px',
+            left: 0,
+            width: '440px',
             maxWidth: '50vw',
-            backgroundColor: 'rgba(11, 17, 33, 0.97)',
+            backgroundColor: '#0b1121',
             borderRight: '2px solid rgba(56, 189, 248, 0.4)',
             display: 'flex',
             flexDirection: 'column',
             zIndex: 40,
-            boxShadow: '4px 0 30px rgba(0,0,0,0.85)'
+            boxShadow: '6px 0 35px rgba(0,0,0,0.9)'
           }}
         >
           {/* Header */}
@@ -1094,17 +1172,22 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                   color: '#ffffff',
                   padding: '6px 10px',
                   borderRadius: '8px',
-                  cursor: 'pointer'
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  fontSize: '12px'
                 }}
               >
                 <ArrowLeft style={{ width: '16px', height: '16px' }} />
+                Каналы
               </button>
               <div>
-                <h2 style={{ fontSize: '17px', fontWeight: 'bold', color: '#ffffff', margin: 0 }}>
+                <h2 style={{ fontSize: '16px', fontWeight: 'bold', color: '#ffffff', margin: 0 }}>
                   {selectedChannel.name}
                 </h2>
                 <p style={{ fontSize: '11px', color: '#38bdf8', margin: '2px 0 0 0' }}>
-                  Телепрограмма & Архив на 7 дней
+                  Архив на 7 дней
                 </p>
               </div>
             </div>
@@ -1162,17 +1245,33 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             })}
           </div>
 
-          {/* Program Schedule List */}
-          <div style={{ flex: 1, overflowY: 'auto', padding: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          {/* Program Schedule List with Smart Centered Auto-Scroll */}
+          <div
+            ref={epgListRef}
+            style={{
+              flex: 1,
+              overflowY: 'auto',
+              padding: '12px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '6px'
+            }}
+          >
             {filteredEpg.map((prog, idx) => {
               const isFocused = focusedProgramIndex === idx;
               const isCurrentLive = prog.isLive;
+              const isFuture = prog.start > Date.now();
 
               return (
                 <div
                   key={prog.id}
+                  id={`epg-item-${idx}`}
                   onClick={() => {
                     setFocusedProgramIndex(idx);
+                    if (isFuture) {
+                      showToast('Передача ещё не началась (Анонс)');
+                      return;
+                    }
                     if (prog.isLive) {
                       setPromptProgram(prog);
                       setPromptFocusedChoice('live');
@@ -1182,27 +1281,28 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                     }
                   }}
                   style={{
-                    padding: '12px 14px',
-                    borderRadius: '12px',
-                    cursor: 'pointer',
+                    padding: '10px 14px',
+                    borderRadius: '10px',
+                    cursor: isFuture ? 'not-allowed' : 'pointer',
                     backgroundColor: isFocused
                       ? '#0284c7'
                       : isCurrentLive
                       ? 'rgba(12, 74, 110, 0.6)'
+                      : isFuture
+                      ? 'rgba(15, 23, 42, 0.4)'
                       : 'rgba(17, 24, 39, 0.6)',
-                    color: '#ffffff',
+                    color: isFuture && !isFocused ? '#64748b' : '#ffffff',
                     border: isFocused
                       ? '3px solid #38bdf8'
                       : isCurrentLive
                       ? '1px solid rgba(56, 189, 248, 0.6)'
                       : '1px solid rgba(51, 65, 85, 0.5)',
-                    boxShadow: isFocused ? '0 0 20px rgba(56, 189, 248, 0.6)' : 'none',
-                    transform: isFocused ? 'scale(1.01)' : 'none',
-                    transition: 'all 0.15s ease'
+                    boxShadow: isFocused ? '0 0 15px rgba(56, 189, 248, 0.5)' : 'none',
+                    opacity: isFuture && !isFocused ? 0.65 : 1.0
                   }}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-                    <span style={{ fontSize: '11px', fontFamily: 'monospace', fontWeight: 'bold', color: isFocused ? '#ffffff' : '#38bdf8' }}>
+                    <span style={{ fontSize: '11px', fontFamily: 'monospace', fontWeight: 'bold', color: isFocused ? '#ffffff' : isFuture ? '#64748b' : '#38bdf8' }}>
                       {formatTime(prog.start)} — {formatTime(prog.end)}
                     </span>
 
@@ -1211,8 +1311,8 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                         style={{
                           fontSize: '10px',
                           fontWeight: 'bold',
-                          padding: '2px 8px',
-                          borderRadius: '10px',
+                          padding: '2px 6px',
+                          borderRadius: '8px',
                           backgroundColor: 'rgba(239, 68, 68, 0.3)',
                           color: '#f87171',
                           border: '1px solid rgba(239, 68, 68, 0.5)'
@@ -1220,13 +1320,26 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                       >
                         ● ЭФИР
                       </span>
+                    ) : isFuture ? (
+                      <span
+                        style={{
+                          fontSize: '10px',
+                          fontWeight: 'bold',
+                          padding: '2px 6px',
+                          borderRadius: '8px',
+                          backgroundColor: 'rgba(71, 85, 105, 0.3)',
+                          color: '#94a3b8'
+                        }}
+                      >
+                        СКОРО
+                      </span>
                     ) : prog.hasArchive ? (
                       <span
                         style={{
                           fontSize: '10px',
                           fontWeight: 'bold',
-                          padding: '2px 8px',
-                          borderRadius: '10px',
+                          padding: '2px 6px',
+                          borderRadius: '8px',
                           backgroundColor: 'rgba(245, 158, 11, 0.25)',
                           color: '#fbbf24',
                           border: '1px solid rgba(245, 158, 11, 0.4)'
@@ -1237,12 +1350,12 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                     ) : null}
                   </div>
 
-                  <h3 style={{ fontSize: '13px', fontWeight: 'bold', margin: '0 0 4px 0', lineHeight: 1.3 }}>
+                  <h3 style={{ fontSize: '13px', fontWeight: 'bold', margin: '0 0 3px 0', lineHeight: 1.3 }}>
                     {prog.title}
                   </h3>
 
                   {prog.description && (
-                    <p style={{ fontSize: '11px', color: isFocused ? '#bae6fd' : '#94a3b8', margin: 0, lineHeight: 1.4, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                    <p style={{ fontSize: '11px', color: isFocused ? '#bae6fd' : '#94a3b8', margin: 0, lineHeight: 1.3, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
                       {prog.description}
                     </p>
                   )}
@@ -1255,7 +1368,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
           <div
             style={{
               padding: '12px 16px',
-              backgroundColor: 'rgba(15, 23, 42, 0.95)',
+              backgroundColor: 'rgba(15, 23, 42, 0.98)',
               borderTop: '1px solid rgba(51, 65, 85, 0.8)',
               fontSize: '11px',
               color: '#94a3b8',
@@ -1269,7 +1382,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
         </div>
       )}
 
-      {/* 6. MODAL PROMPT: LIVE VS START FROM BEGINNING */}
+      {/* 5. MODAL PROMPT: LIVE VS START FROM BEGINNING */}
       {overlayMode === 'prompt' && promptProgram && (
         <div
           style={{
@@ -1341,8 +1454,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                   border: promptFocusedChoice === 'live' ? '3px solid #f87171' : '1px solid rgba(51, 65, 85, 0.8)',
                   backgroundColor: promptFocusedChoice === 'live' ? '#ef4444' : '#1e293b',
                   color: '#ffffff',
-                  boxShadow: promptFocusedChoice === 'live' ? '0 0 25px rgba(239, 68, 68, 0.6)' : 'none',
-                  transform: promptFocusedChoice === 'live' ? 'scale(1.02)' : 'none'
+                  boxShadow: promptFocusedChoice === 'live' ? '0 0 20px rgba(239, 68, 68, 0.5)' : 'none'
                 }}
               >
                 ● Смотреть прямой эфир
@@ -1367,8 +1479,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                   border: promptFocusedChoice === 'start' ? '3px solid #38bdf8' : '1px solid rgba(51, 65, 85, 0.8)',
                   backgroundColor: promptFocusedChoice === 'start' ? '#0284c7' : '#1e293b',
                   color: '#ffffff',
-                  boxShadow: promptFocusedChoice === 'start' ? '0 0 25px rgba(56, 189, 248, 0.6)' : 'none',
-                  transform: promptFocusedChoice === 'start' ? 'scale(1.02)' : 'none'
+                  boxShadow: promptFocusedChoice === 'start' ? '0 0 20px rgba(56, 189, 248, 0.5)' : 'none'
                 }}
               >
                 <RotateCcw style={{ width: '18px', height: '18px' }} />
@@ -1393,7 +1504,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
         </div>
       )}
 
-      {/* 7. TIMELINE / TIMESHIFT OSD BAR (Triggered by remote "DOWN") */}
+      {/* 6. TIMELINE / TIMESHIFT OSD BAR (Triggered by remote "DOWN") */}
       {overlayMode === 'timeline' && selectedChannel && (
         <div
           style={{
@@ -1555,7 +1666,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
         </div>
       )}
 
-      {/* 8. SETTINGS MODAL */}
+      {/* 7. SETTINGS MODAL */}
       {overlayMode === 'settings' && (
         <div
           style={{
