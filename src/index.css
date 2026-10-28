@@ -28,3 +28,32 @@
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(148, 163, 184, 0.6);
 }
+
+/* TV Smart Browser Safe Classes (100% RGB/HEX compatibility without OKLCH) */
+.tv-bg-dark {
+  background-color: #050811 !important;
+}
+.tv-bg-panel {
+  background-color: rgba(11, 17, 33, 0.96) !important;
+  border-color: rgba(51, 65, 85, 0.8) !important;
+}
+.tv-bg-card {
+  background-color: rgba(17, 24, 39, 0.85) !important;
+  border-color: rgba(51, 65, 85, 0.5) !important;
+}
+.tv-bg-focused {
+  background-color: #0284c7 !important;
+  color: #ffffff !important;
+  border-color: #38bdf8 !important;
+  box-shadow: 0 0 25px rgba(56, 189, 248, 0.7) !important;
+  outline: 3px solid #38bdf8 !important;
+}
+.tv-text-white {
+  color: #ffffff !important;
+}
+.tv-text-muted {
+  color: #94a3b8 !important;
+}
+.tv-text-accent {
+  color: #38bdf8 !important;
+}
