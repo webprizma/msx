@@ -98,9 +98,9 @@ let currentMsxPlaylist: any = {
                 layout: "3,3,3,3",
                 color: "msx-glass",
                 icon: "https://cdn-icons-png.flaticon.com/512/3845/3845874.png",
-                label: "IPTV Player",
-                badge: "Телевидение",
-                action: "link:https://tv.ott-play.com"
+                label: "Моё ТВ (Архив 7д)",
+                badge: "IPTV Архив",
+                action: "link:{PREFIX}{SERVER}/tv"
               },
               {
                 id: "item-7",

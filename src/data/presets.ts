@@ -6,7 +6,7 @@ export const POPULAR_PRESETS: PresetApp[] = [
     name: 'Моё ТВ (Архив 7 дней)',
     category: 'ТВ / IPTV',
     icon: 'https://cdn-icons-png.flaticon.com/512/3845/3845874.png',
-    action: 'link:http://{SERVER}/tv',
+    action: 'link:{PREFIX}{SERVER}/tv',
     badge: 'Архив 7 дней',
     description: 'Собственный IPTV плеер с перемоткой на 7 дней назад, телепрограммой и поддержкой архивов M3U8.',
     recommendedLayout: '0,0,4,3',
