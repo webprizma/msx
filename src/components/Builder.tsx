@@ -247,21 +247,27 @@ export const Builder: React.FC<BuilderProps> = ({
         </div>
 
         <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1.5 text-xs text-slate-400 bg-slate-950/60 px-2.5 py-1.5 rounded-lg border border-slate-800">
+            <span className={`w-2 h-2 rounded-full ${isSaving ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} />
+            <span>{isSaving ? 'Сохранение на сервер...' : 'Автосохранение активно'}</span>
+          </div>
+
           <button
             onClick={() => setShowPortalSettings(!showPortalSettings)}
             className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors cursor-pointer"
           >
             <Settings className="w-4 h-4" />
-            <span>Настройки темы & фона</span>
+            <span>Настройки темы</span>
           </button>
 
           <button
             onClick={onSaveToServer}
             disabled={isSaving}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 text-xs font-semibold transition-colors cursor-pointer shadow-sm disabled:opacity-50"
+            className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition-colors cursor-pointer border border-slate-700 disabled:opacity-50"
+            title="Принудительно отправить текущее состояние на сервер"
           >
-            <Save className="w-4 h-4" />
-            <span>{isSaving ? 'Сохранение...' : 'Сохранить на сервере'}</span>
+            <Save className="w-4 h-4 text-sky-400" />
+            <span>Синхронизировать</span>
           </button>
         </div>
       </div>

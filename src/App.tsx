@@ -85,27 +85,33 @@ export default function App() {
     }
   }, []);
 
-  const handleSaveToServer = async () => {
+  const handleUpdateAndSavePlaylist = async (newPlaylist: MsxPlaylist) => {
+    setPlaylist(newPlaylist);
     setIsSaving(true);
-    setSaveMessage(null);
     try {
       const response = await fetch('/api/msx/playlist', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(playlist)
+        body: JSON.stringify(newPlaylist)
       });
       if (response.ok) {
-        setSaveMessage('Плейлист успешно сохранён на сервере и готов к загрузке в ТВ!');
-        setTimeout(() => setSaveMessage(null), 4000);
-      } else {
-        throw new Error('Server response error');
+        const data = await response.json();
+        if (data && data.playlist) {
+          setPlaylist(normalizePlaylist(data.playlist));
+        }
+        setSaveMessage(`✓ Автосохранение выполнено (${data.playlist?.version || 'v1.0'})`);
+        setTimeout(() => setSaveMessage(null), 3000);
       }
     } catch (e: any) {
-      setSaveMessage('Плейлист сохранён локально в приложении.');
-      setTimeout(() => setSaveMessage(null), 3000);
+      setSaveMessage('Сохранено локально в браузере');
+      setTimeout(() => setSaveMessage(null), 2500);
     } finally {
       setIsSaving(false);
     }
+  };
+
+  const handleManualSave = async () => {
+    await handleUpdateAndSavePlaylist(playlist);
   };
 
   const handleCopyEndpoint = () => {
@@ -194,8 +200,8 @@ export default function App() {
         {activeTab === 'builder' && (
           <Builder
             playlist={playlist}
-            onUpdatePlaylist={setPlaylist}
-            onSaveToServer={handleSaveToServer}
+            onUpdatePlaylist={handleUpdateAndSavePlaylist}
+            onSaveToServer={handleManualSave}
             isSaving={isSaving}
             saveMessage={saveMessage}
           />

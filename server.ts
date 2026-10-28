@@ -1,16 +1,18 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const DATA_FILE = path.resolve(__dirname, 'msx-data.json');
 
 const app = express();
 const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
 app.use(express.json());
 
-// In-memory current MSX playlist state
+// In-memory default MSX playlist state
 let currentMsxPlaylist: any = {
   name: "Мой Домашний MSX Портал",
   version: "1.0.0",
@@ -200,6 +202,19 @@ app.use((req, res, next) => {
   next();
 });
 
+// Load persistent data from disk if present
+try {
+  if (fs.existsSync(DATA_FILE)) {
+    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && Array.isArray(parsed.menu)) {
+      currentMsxPlaylist = parsed;
+    }
+  }
+} catch (e) {
+  console.error('Error reading msx-data.json:', e);
+}
+
 function sendJson(res: express.Response, data: any) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -210,10 +225,11 @@ function sendJson(res: express.Response, data: any) {
 
 // Helper: Start Object required by MSX specification (Settings -> Start Parameter)
 function getStartObject() {
+  const ver = currentMsxPlaylist.version || '1.0.0';
   return {
     name: currentMsxPlaylist.name || "MSX Home Server",
-    version: currentMsxPlaylist.version || "1.0.0",
-    parameter: "menu:{PREFIX}{SERVER}/msx/menu.json"
+    version: ver,
+    parameter: `menu:{PREFIX}{SERVER}/msx/menu.json?v=${ver}`
   };
 }
 
@@ -242,15 +258,34 @@ app.get('/api/msx/playlist', (req, res) => {
   res.json(currentMsxPlaylist);
 });
 
-// API to update current playlist from builder
+// API to update current playlist from builder (automatically persists and increments version)
 app.post('/api/msx/playlist', (req, res) => {
   try {
     const newPlaylist = req.body;
     if (!newPlaylist || typeof newPlaylist !== 'object') {
       return res.status(400).json({ error: 'Invalid playlist object' });
     }
+
+    // Auto-increment version counter so MSX automatically invalidates its cache
+    const currentVerStr = String(currentMsxPlaylist.version || '1.0.0');
+    const match = currentVerStr.match(/(\d+)$/);
+    const rev = match ? parseInt(match[1], 10) + 1 : Date.now();
+    newPlaylist.version = `1.0.${rev}`;
+
     currentMsxPlaylist = newPlaylist;
-    res.json({ success: true, message: 'Плейлист успешно сохранён', playlist: currentMsxPlaylist });
+
+    // Persist to disk
+    try {
+      fs.writeFileSync(DATA_FILE, JSON.stringify(currentMsxPlaylist, null, 2), 'utf8');
+    } catch (fsErr) {
+      console.error('Failed to write to msx-data.json:', fsErr);
+    }
+
+    res.json({
+      success: true,
+      message: `Плейлист сохранён (версия ${currentMsxPlaylist.version})`,
+      playlist: currentMsxPlaylist
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Server error' });
   }
