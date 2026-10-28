@@ -22,7 +22,7 @@ fi
 
 # 3. Install project dependencies and build frontend
 echo "[3/4] Установка зависимостей и сборка приложения..."
-npm install
+npm install --legacy-peer-deps
 npm run build
 
 # 4. Configure systemd service for auto-start on boot
