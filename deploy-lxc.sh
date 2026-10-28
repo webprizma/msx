@@ -6,8 +6,9 @@ echo "  🚀 Развертывание MSX Home Server в Proxmox VE (LXC)"
 echo "=========================================================="
 
 # 1. Update and install system dependencies
-echo "[1/4] Обновление пакетов и установка curl, git..."
+echo "[1/4] Обновление системы и установка curl, git..."
 apt-get update -y
+apt-get upgrade -y
 apt-get install -y curl git ca-certificates
 
 # 2. Check and install Node.js 20 LTS if needed

@@ -15,16 +15,25 @@
 * **Network:** Рекомендуется задать **статический IP-адрес** (например, `192.168.1.50/24`, Gateway: `192.168.1.1`), чтобы телевизор всегда обращался по одному неизменному адресу.
 
 ### 2. Клонирование и автоматическая установка
-Войдите в консоль созданного LXC-контейнера (или подключитесь по SSH) и выполните:
+В чистом контейнере Proxmox сначала обновите пакеты системы и установите `git`:
 
 ```bash
-# Клонируем репозиторий
+apt update && apt upgrade -y && apt install -y git curl ca-certificates
+```
+
+Затем клонируйте репозиторий и запустите установщик:
+
+```bash
 git clone https://github.com/webprizma/msx.git /opt/msx
 cd /opt/msx
-
-# Запускаем автоустановщик (ставит Node.js, собирает проект и регистрирует systemd службу)
 chmod +x deploy-lxc.sh
 ./deploy-lxc.sh
+```
+
+Либо одной командой (всё вместе):
+
+```bash
+apt update && apt upgrade -y && apt install -y git curl ca-certificates && git clone https://github.com/webprizma/msx.git /opt/msx && cd /opt/msx && ./deploy-lxc.sh
 ```
 
 Скрипт автоматически:
