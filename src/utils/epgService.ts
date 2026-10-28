@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { EpgProgram } from '../types/iptv';
+import type { EpgProgram } from '../types/iptv.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -107,16 +107,25 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
         tempAliases.set(normalizeName(chName), chId);
       }
 
-      // 2. Extract programmes <programme start="..." stop="..." channel="..."> ... </programme>
+      // 2. Extract programmes <programme ...> ... </programme> regardless of attribute order
       let progMatch;
-      const progRegex = /<programme[^>]*start="([^"]+)"[^>]*stop="([^"]+)"[^>]*channel="([^"]+)"[^>]*>([\s\S]*?)<\/programme>/gi;
+      const progRegex = /<programme\s+([^>]+)>([\s\S]*?)<\/programme>/gi;
       let lastIndex = 0;
 
       while ((progMatch = progRegex.exec(buffer)) !== null) {
         lastIndex = progRegex.lastIndex;
-        const [_, startStr, stopStr, chId, inner] = progMatch;
-        const start = parseXmltvDate(startStr);
-        const end = parseXmltvDate(stopStr);
+        const attrs = progMatch[1];
+        const inner = progMatch[2];
+
+        const chIdMatch = attrs.match(/channel="([^"]+)"/i);
+        const startMatch = attrs.match(/start="([^"]+)"/i);
+        const stopMatch = attrs.match(/stop="([^"]+)"/i);
+
+        if (!chIdMatch || !startMatch || !stopMatch) continue;
+
+        const chId = chIdMatch[1];
+        const start = parseXmltvDate(startMatch[1]);
+        const end = parseXmltvDate(stopMatch[1]);
         if (!start || !end) continue;
 
         const titleMatch = inner.match(/<title[^>]*>([\s\S]*?)<\/title>/i);

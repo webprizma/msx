@@ -119,16 +119,25 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     return () => clearTimeout(timer);
   }, [toastMessage]);
 
-  // Format helpers
-  const formatTime = (ms: number) => {
-    const d = new Date(ms);
-    return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-  };
+  // Format helpers with optional custom timezone offset
+  const getTimeWithOffset = useCallback((ms: number) => {
+    if (settings.timeZoneOffset === undefined || settings.timeZoneOffset === 'auto') {
+      return new Date(ms);
+    }
+    const offsetHours = typeof settings.timeZoneOffset === 'number' ? settings.timeZoneOffset : 3;
+    const localOffsetMs = new Date(ms).getTimezoneOffset() * 60000;
+    return new Date(ms + (offsetHours * 3600000) + localOffsetMs);
+  }, [settings.timeZoneOffset]);
 
-  const formatSecondsToClock = (ms: number) => {
-    const d = new Date(ms);
+  const formatTime = useCallback((ms: number) => {
+    const d = getTimeWithOffset(ms);
+    return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  }, [getTimeWithOffset]);
+
+  const formatSecondsToClock = useCallback((ms: number) => {
+    const d = getTimeWithOffset(ms);
     return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  };
+  }, [getTimeWithOffset]);
 
   // Filter groups
   const groups = useMemo(() => {
@@ -1946,6 +1955,44 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                   onChange={(e) => setSettings({ ...settings, archiveDays: parseInt(e.target.value, 10) })}
                   style={{ width: '100%' }}
                 />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', color: '#cbd5e1', fontSize: '12px', fontWeight: 'bold', marginBottom: '6px' }}>
+                  Часовой пояс телепрограммы (EPG):
+                </label>
+                <select
+                  value={settings.timeZoneOffset === undefined ? 'auto' : settings.timeZoneOffset}
+                  onChange={(e) => {
+                    const val = e.target.value === 'auto' ? 'auto' : parseInt(e.target.value, 10);
+                    setSettings({ ...settings, timeZoneOffset: val });
+                  }}
+                  style={{
+                    width: '100%',
+                    padding: '10px 14px',
+                    borderRadius: '8px',
+                    backgroundColor: '#020617',
+                    border: '1px solid #334155',
+                    color: '#ffffff',
+                    fontSize: '12px',
+                    outline: 'none',
+                    boxSizing: 'border-box'
+                  }}
+                >
+                  <option value="auto">Авто (системное время ТВ/устройства)</option>
+                  <option value="3">UTC+3 — Москва, Санкт-Петербург, Минск (MSK)</option>
+                  <option value="2">UTC+2 — Калининград</option>
+                  <option value="4">UTC+4 — Самара, Ижевск</option>
+                  <option value="5">UTC+5 — Екатеринбург, Уфа, Тюмень</option>
+                  <option value="6">UTC+6 — Омск</option>
+                  <option value="7">UTC+7 — Красноярск, Новосибирск</option>
+                  <option value="8">UTC+8 — Иркутск</option>
+                  <option value="9">UTC+9 — Якутск</option>
+                  <option value="10">UTC+10 — Владивосток</option>
+                </select>
+                <p style={{ fontSize: '11px', color: '#64748b', margin: '4px 0 0 0' }}>
+                  Для большинства каналов TV.Team выберите UTC+3 (Москва), если часы ТВ сбиты
+                </p>
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', marginTop: '12px' }}>

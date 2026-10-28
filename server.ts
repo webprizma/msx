@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { initEpgCache, syncEpg, getChannelEpg } from './src/utils/epgService';
+import { initEpgCache, syncEpg, getChannelEpg } from './src/utils/epgService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -401,10 +401,13 @@ app.get('/api/iptv/channels', async (req, res) => {
             curr.id = `ch-${channels.length + 1}`;
             curr.tvgId = tvgIdMatch?.[1] || '';
             curr.tvgName = tvgNameMatch?.[1] || '';
-            curr.logo = tvgLogoMatch?.[1] || '';
-            curr.group = groupMatch?.[1] || 'Общие';
+            const rawGroup = groupMatch?.[1];
+            curr.group = rawGroup ? rawGroup.replace(/^\d+\.\s*/, '') : 'Общие';
             curr.catchupDays = catchupDaysMatch ? parseInt(catchupDaysMatch[1], 10) : 7;
             curr.catchupSource = catchupSourceMatch?.[1];
+          } else if (line.startsWith('#EXTGRP:') && curr) {
+            const rawGrp = line.substring(8).trim();
+            curr.group = rawGrp.replace(/^\d+\.\s*/, '') || rawGrp;
           } else if (line.length > 0 && !line.startsWith('#') && curr) {
             curr.streamUrl = line;
             if (curr.name && curr.streamUrl) {

@@ -27,11 +27,15 @@ export function parseM3uPlaylist(content: string, defaultCatchupDays = 7): Chann
       currentChannel.id = `ch-${channels.length + 1}-${Date.now()}`;
       currentChannel.name = title || tvgNameMatch?.[1] || 'Канал';
       currentChannel.logo = tvgLogoMatch?.[1] || '';
-      currentChannel.group = groupMatch?.[1] || 'Общие';
+      const rawGrp = groupMatch?.[1];
+      currentChannel.group = rawGrp ? rawGrp.replace(/^\d+\.\s*/, '') : 'Общие';
       currentChannel.tvgId = tvgIdMatch?.[1] || tvgNameMatch?.[1] || title;
       currentChannel.catchupDays = catchupDaysMatch ? parseInt(catchupDaysMatch[1], 10) : defaultCatchupDays;
       currentChannel.catchupSource = catchupSourceMatch?.[1];
       currentChannel.catchupType = catchupMatch?.[1] || 'shift';
+    } else if (line.startsWith('#EXTGRP:') && currentChannel) {
+      const raw = line.substring(8).trim();
+      currentChannel.group = raw.replace(/^\d+\.\s*/, '') || raw;
     } else if (line.length > 0 && !line.startsWith('#') && currentChannel) {
       currentChannel.streamUrl = line;
       if (currentChannel.name && currentChannel.streamUrl) {

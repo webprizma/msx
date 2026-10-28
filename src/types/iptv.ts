@@ -29,4 +29,5 @@ export interface IptvSettings {
   epgUrl?: string;
   archiveDays: number;
   providerType: string;
+  timeZoneOffset?: number | 'auto';
 }
