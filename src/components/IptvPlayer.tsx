@@ -42,6 +42,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   const categoryBarRef = useRef<HTMLDivElement | null>(null);
   const daySelectorRef = useRef<HTMLDivElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const epgCache = useRef<Map<string, EpgProgram[]>>(new Map());
 
   const timelineHideTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const seekDebounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -251,13 +252,98 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     loadChannels(settings.playlistUrl);
   }, [loadChannels, settings.playlistUrl]);
 
-  // Whenever selectedChannel changes, fetch REAL EPG from backend
+  // Helper: center active category tab (instant on open, smooth on user keys)
+  const alignCategoryBar = useCallback((smooth = false, grp = activeGroup) => {
+    const container = categoryBarRef.current;
+    if (!container) return;
+    const catIdx = groups.indexOf(grp);
+    if (catIdx >= 0 && container.children[catIdx]) {
+      const btn = container.children[catIdx] as HTMLElement;
+      const targetLeft = Math.max(0, btn.offsetLeft - (container.clientWidth / 2) + (btn.clientWidth / 2));
+      if (smooth) {
+        container.scrollTo({ left: targetLeft, behavior: 'smooth' });
+      } else {
+        container.scrollLeft = targetLeft;
+      }
+    }
+  }, [groups, activeGroup]);
+
+  // Helper: center active day selector tab (instant on open, smooth on user keys)
+  const alignDaySelector = useCallback((smooth = false, offset = selectedDayOffset) => {
+    const container = daySelectorRef.current;
+    if (!container) return;
+    const dayOffsets = [-7, -6, -5, -4, -3, -2, -1, 0, 1];
+    const dayIdx = dayOffsets.indexOf(offset);
+    if (dayIdx >= 0 && container.children[dayIdx]) {
+      const btn = container.children[dayIdx] as HTMLElement;
+      const targetLeft = Math.max(0, btn.offsetLeft - (container.clientWidth / 2) + (btn.clientWidth / 2));
+      if (smooth) {
+        container.scrollTo({ left: targetLeft, behavior: 'smooth' });
+      } else {
+        container.scrollLeft = targetLeft;
+      }
+    }
+  }, [selectedDayOffset]);
+
+  // Helper: center focused channel item
+  const alignChannelList = useCallback((smooth = false, chIdx = focusedChannelIndex) => {
+    const container = channelListRef.current;
+    if (!container) return;
+    const targetTop = Math.max(0, chIdx * CHANNEL_ITEM_HEIGHT - (container.clientHeight / 2) + (CHANNEL_ITEM_HEIGHT / 2));
+    if (smooth) {
+      container.scrollTo({ top: targetTop, behavior: 'smooth' });
+    } else {
+      container.scrollTop = targetTop;
+    }
+  }, [focusedChannelIndex, CHANNEL_ITEM_HEIGHT]);
+
+  // Helper: center focused program item
+  const alignEpgList = useCallback((smooth = false, progIdx = focusedProgramIndex) => {
+    const container = epgListRef.current;
+    if (!container) return;
+    const itemEl = document.getElementById(`epg-item-${progIdx}`);
+    if (itemEl) {
+      const targetTop = Math.max(0, itemEl.offsetTop - (container.clientHeight / 2) + (itemEl.clientHeight / 2));
+      if (smooth) {
+        container.scrollTo({ top: targetTop, behavior: 'smooth' });
+      } else {
+        container.scrollTop = targetTop;
+      }
+    }
+  }, [focusedProgramIndex]);
+
+  // Whenever selectedChannel changes, fetch REAL EPG from backend (with in-memory cache)
   useEffect(() => {
     if (!selectedChannel) return;
     let isCancelled = false;
     let retryTimer: NodeJS.Timeout | null = null;
-    setIsLoadingEpg(true);
 
+    // Check fast client cache
+    if (epgCache.current.has(selectedChannel.id)) {
+      const cached = epgCache.current.get(selectedChannel.id)!;
+      const now = Date.now();
+      if (cached.length > 0) {
+        const programs = cached.map(p => ({
+          ...p,
+          isLive: now >= p.start && now < p.end,
+          hasArchive: p.end <= now
+        }));
+        setEpgList(programs);
+        const liveProg = programs.find(p => p.isLive) || programs.find(p => p.end <= now) || programs[0];
+        setCurrentPlayingProgram(liveProg);
+        setActiveTimelineProgram(liveProg);
+        setSeekTimestamp(now);
+        setIsArchiveMode(false);
+        setIsLoadingEpg(false);
+        return;
+      } else {
+        setEpgList([]);
+        setIsLoadingEpg(false);
+        return;
+      }
+    }
+
+    setIsLoadingEpg(true);
     const tvgId = selectedChannel.tvgId || '';
     const name = selectedChannel.name || '';
 
@@ -269,7 +355,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           const now = Date.now();
 
           if (Array.isArray(realPrograms) && realPrograms.length > 0) {
-            // Re-evaluate isLive and hasArchive with current client timestamp
+            epgCache.current.set(selectedChannel.id, realPrograms);
             const programs = realPrograms.map(p => ({
               ...p,
               isLive: now >= p.start && now < p.end,
@@ -284,7 +370,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             setIsArchiveMode(false);
             setIsLoadingEpg(false);
 
-            // Auto-check: if no programs overlap selectedDayOffset, align to closest day with programs
+            // Auto-check: if no programs overlap current selectedDayOffset, align to closest day with programs
             const tzOffsetMs = 3 * 3600 * 1000;
             const nowInMsk = new Date(Date.now() + tzOffsetMs);
             const hasProgramsForCurrentDay = programs.some(p => {
@@ -322,13 +408,9 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                   retryTimer = setTimeout(() => {
                     if (!isCancelled) fetchEpg(attempt + 1);
                   }, 1500);
-                } else if (attempt <= 4) {
-                  // Retry up to 4 times for initial boot
-                  retryTimer = setTimeout(() => {
-                    if (!isCancelled) fetchEpg(attempt + 1);
-                  }, 2000);
                 } else {
                   // Truly no EPG for this channel
+                  epgCache.current.set(selectedChannel.id, []);
                   setEpgList([]);
                   const fallbackLive: EpgProgram = {
                     id: `live-${selectedChannel.id}`,
@@ -350,19 +432,15 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               })
               .catch(() => {
                 if (isCancelled) return;
-                if (attempt <= 4) {
-                  retryTimer = setTimeout(() => {
-                    if (!isCancelled) fetchEpg(attempt + 1);
-                  }, 2000);
-                } else {
-                  setEpgList([]);
-                  setIsLoadingEpg(false);
-                }
+                epgCache.current.set(selectedChannel.id, []);
+                setEpgList([]);
+                setIsLoadingEpg(false);
               });
           }
         })
         .catch(() => {
           if (isCancelled) return;
+          epgCache.current.set(selectedChannel.id, []);
           setEpgList([]);
           setIsLoadingEpg(false);
         });
@@ -374,35 +452,19 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       isCancelled = true;
       if (retryTimer) clearTimeout(retryTimer);
     };
-  }, [selectedChannel, selectedDayOffset]);
+  }, [selectedChannel?.id]);
 
   // INSTANT AUTO-ALIGNMENT ON OVERLAY OPEN
-  // When opening channels or epg drawer, immediately center categories, channels, dates, and programs
   useEffect(() => {
     if (overlayMode === 'channels') {
-      const alignChannelsOnOpen = () => {
-        // 1. Center active category tab
-        const catBtn = document.getElementById(`cat-btn-${encodeURIComponent(activeGroup)}`);
-        if (catBtn) {
-          catBtn.scrollIntoView({ behavior: 'auto', inline: 'center', block: 'nearest' });
-        }
-
-        // 2. Center focused channel in list
-        const container = channelListRef.current;
-        const itemEl = document.getElementById(`ch-item-${focusedChannelIndex}`);
-        if (container && itemEl) {
-          const cHeight = container.clientHeight;
-          const iTop = itemEl.offsetTop;
-          const iHeight = itemEl.clientHeight;
-          container.scrollTo({ top: Math.max(0, iTop - (cHeight / 2) + (iHeight / 2)), behavior: 'auto' });
-        }
+      const doAlignChannels = () => {
+        alignCategoryBar(false);
+        alignChannelList(false);
       };
-
-      alignChannelsOnOpen();
-      const r1 = requestAnimationFrame(alignChannelsOnOpen);
-      const t1 = setTimeout(alignChannelsOnOpen, 40);
-      const t2 = setTimeout(alignChannelsOnOpen, 120);
-
+      doAlignChannels();
+      const r1 = requestAnimationFrame(doAlignChannels);
+      const t1 = setTimeout(doAlignChannels, 30);
+      const t2 = setTimeout(doAlignChannels, 100);
       return () => {
         cancelAnimationFrame(r1);
         clearTimeout(t1);
@@ -411,86 +473,51 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }
 
     if (overlayMode === 'epg') {
-      const alignEpgOnOpen = () => {
-        // 1. Center active day selector tab (e.g. Сегодня)
-        const dayBtn = document.getElementById(`day-btn-${selectedDayOffset}`);
-        if (dayBtn) {
-          dayBtn.scrollIntoView({ behavior: 'auto', inline: 'center', block: 'nearest' });
-        }
-
-        // 2. Center focused program in schedule list
-        const container = epgListRef.current;
-        const itemEl = document.getElementById(`epg-item-${focusedProgramIndex}`);
-        if (container && itemEl) {
-          const cHeight = container.clientHeight;
-          const iTop = itemEl.offsetTop;
-          const iHeight = itemEl.clientHeight;
-          container.scrollTo({ top: Math.max(0, iTop - (cHeight / 2) + (iHeight / 2)), behavior: 'auto' });
-        }
+      const doAlignEpg = () => {
+        alignDaySelector(false);
+        alignEpgList(false);
       };
-
-      alignEpgOnOpen();
-      const r1 = requestAnimationFrame(alignEpgOnOpen);
-      const t1 = setTimeout(alignEpgOnOpen, 40);
-      const t2 = setTimeout(alignEpgOnOpen, 120);
-
+      doAlignEpg();
+      const r1 = requestAnimationFrame(doAlignEpg);
+      const t1 = setTimeout(doAlignEpg, 30);
+      const t2 = setTimeout(doAlignEpg, 100);
       return () => {
         cancelAnimationFrame(r1);
         clearTimeout(t1);
         clearTimeout(t2);
       };
     }
-  }, [overlayMode]);
+  }, [overlayMode, alignCategoryBar, alignChannelList, alignDaySelector, alignEpgList]);
 
-  // AUTO-SCROLL FOR CATEGORY TABS (Smooth tracking on user navigation)
+  // When activeGroup changes (via navigation or click), smooth scroll category bar
   useEffect(() => {
-    if (overlayMode !== 'channels') return;
-    const itemEl = document.getElementById(`cat-btn-${encodeURIComponent(activeGroup)}`);
-    if (itemEl) {
-      itemEl.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+    if (overlayMode === 'channels') {
+      alignCategoryBar(true, activeGroup);
     }
-  }, [activeGroup]);
+  }, [activeGroup, overlayMode, alignCategoryBar]);
 
-  // AUTO-SCROLL FOR EPG DAY SELECTOR TABS (Smooth tracking on user navigation)
+  // When selectedDayOffset changes (via navigation or click), smooth scroll date bar
   useEffect(() => {
-    if (overlayMode !== 'epg') return;
-    const itemEl = document.getElementById(`day-btn-${selectedDayOffset}`);
-    if (itemEl) {
-      itemEl.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+    if (overlayMode === 'epg') {
+      alignDaySelector(true, selectedDayOffset);
     }
-  }, [selectedDayOffset]);
+  }, [selectedDayOffset, overlayMode, alignDaySelector]);
 
-  // SMART AUTO-SCROLL FOR CHANNELS (Smooth tracking on user navigation)
+  // When focusedChannelIndex changes, smooth scroll channel list
   useEffect(() => {
-    if (overlayMode !== 'channels') return;
-    const container = channelListRef.current;
-    if (!container) return;
-    const itemEl = document.getElementById(`ch-item-${focusedChannelIndex}`);
-    if (itemEl) {
-      const cHeight = container.clientHeight;
-      const iTop = itemEl.offsetTop;
-      const iHeight = itemEl.clientHeight;
-      const targetScroll = iTop - (cHeight / 2) + (iHeight / 2);
-      container.scrollTo({ top: Math.max(0, targetScroll), behavior: 'smooth' });
+    if (overlayMode === 'channels') {
+      alignChannelList(true, focusedChannelIndex);
     }
-  }, [focusedChannelIndex]);
+  }, [focusedChannelIndex, overlayMode, alignChannelList]);
 
-  // SMART AUTO-SCROLL FOR EPG PROGRAMS (Smooth tracking on user navigation)
+  // When focusedProgramIndex changes, smooth scroll EPG list
   useEffect(() => {
-    if (overlayMode !== 'epg') return;
-    const container = epgListRef.current;
-    if (!container) return;
-    const itemEl = document.getElementById(`epg-item-${focusedProgramIndex}`);
-    if (itemEl) {
-      const cHeight = container.clientHeight;
-      const iTop = itemEl.offsetTop;
-      const iHeight = itemEl.clientHeight;
-      const targetScroll = iTop - (cHeight / 2) + (iHeight / 2);
-      container.scrollTo({ top: Math.max(0, targetScroll), behavior: 'smooth' });
+    if (overlayMode === 'epg') {
+      alignEpgList(true, focusedProgramIndex);
     }
-  }, [focusedProgramIndex]);
+  }, [focusedProgramIndex, overlayMode, alignEpgList]);
 
-  // Automatically focus & center the current live program when EPG loads or date changes
+  // When filteredEpg loads or date changes, focus current live/nearest program
   useEffect(() => {
     if (overlayMode === 'epg' && filteredEpg.length > 0) {
       const now = Date.now();
@@ -505,17 +532,10 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       setFocusedProgramIndex(targetIdx);
 
       setTimeout(() => {
-        const container = epgListRef.current;
-        const itemEl = document.getElementById(`epg-item-${targetIdx}`);
-        if (container && itemEl) {
-          const cHeight = container.clientHeight;
-          const iTop = itemEl.offsetTop;
-          const iHeight = itemEl.clientHeight;
-          container.scrollTo({ top: Math.max(0, iTop - (cHeight / 2) + (iHeight / 2)), behavior: 'auto' });
-        }
-      }, 30);
+        alignEpgList(false, targetIdx);
+      }, 40);
     }
-  }, [overlayMode, selectedDayOffset, filteredEpg.length]);
+  }, [overlayMode, selectedDayOffset, filteredEpg.length, alignEpgList]);
 
   // Stream Playback Handler with HLS.js
   const playStream = useCallback((streamUrl: string) => {
@@ -862,8 +882,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               const nextGrp = groups[nextGrpIdx];
               setActiveGroup(nextGrp);
               setFocusedChannelIndex(0);
-              const btn = document.getElementById(`cat-btn-${encodeURIComponent(nextGrp)}`);
-              if (btn) btn.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+              alignCategoryBar(true, nextGrp);
             }
             break;
 
@@ -874,8 +893,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               const nextGrp = groups[nextGrpIdx];
               setActiveGroup(nextGrp);
               setFocusedChannelIndex(0);
-              const btn = document.getElementById(`cat-btn-${encodeURIComponent(nextGrp)}`);
-              if (btn) btn.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+              alignCategoryBar(true, nextGrp);
             }
             break;
 
@@ -911,8 +929,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               const nextOffset = Math.max(-7, selectedDayOffset - 1);
               setSelectedDayOffset(nextOffset);
               setFocusedProgramIndex(0);
-              const btn = document.getElementById(`day-btn-${nextOffset}`);
-              if (btn) btn.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+              alignDaySelector(true, nextOffset);
             }
             break;
 
@@ -921,8 +938,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               const nextOffset = Math.min(1, selectedDayOffset + 1);
               setSelectedDayOffset(nextOffset);
               setFocusedProgramIndex(0);
-              const btn = document.getElementById(`day-btn-${nextOffset}`);
-              if (btn) btn.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+              alignDaySelector(true, nextOffset);
             }
             break;
 
@@ -1314,8 +1330,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               padding: '10px 16px',
               overflowX: 'auto',
               borderBottom: '1px solid rgba(51, 65, 85, 0.5)',
-              scrollbarWidth: 'none',
-              scrollBehavior: 'smooth'
+              scrollbarWidth: 'none'
             }}
           >
             {groups.map((group) => {
@@ -1557,8 +1572,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               padding: '10px 16px',
               overflowX: 'auto',
               borderBottom: '1px solid rgba(51, 65, 85, 0.5)',
-              scrollbarWidth: 'none',
-              scrollBehavior: 'smooth'
+              scrollbarWidth: 'none'
             }}
           >
             {[-7, -6, -5, -4, -3, -2, -1, 0, 1].map((offset) => {
