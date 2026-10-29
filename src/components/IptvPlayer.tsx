@@ -92,6 +92,21 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   const [isSyncingEpg, setIsSyncingEpg] = useState(false);
   const [isLoadingEpg, setIsLoadingEpg] = useState(false);
 
+  // Stable refs to prevent callback re-creations and avoid circular effect re-triggers
+  const activeGroupRef = useRef(activeGroup);
+  activeGroupRef.current = activeGroup;
+
+  const selectedDayOffsetRef = useRef(selectedDayOffset);
+  selectedDayOffsetRef.current = selectedDayOffset;
+
+  const focusedChannelIndexRef = useRef(focusedChannelIndex);
+  focusedChannelIndexRef.current = focusedChannelIndex;
+
+  const focusedProgramIndexRef = useRef(focusedProgramIndex);
+  focusedProgramIndexRef.current = focusedProgramIndex;
+
+  const lastEpgFocusKeyRef = useRef<string>('');
+
   // Auto-hide bottom hint after 3 seconds of inactivity
   const pokeBottomHint = useCallback(() => {
     setShowBottomHint(true);
@@ -253,10 +268,11 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   }, [loadChannels, settings.playlistUrl]);
 
   // Helper: center active category tab (instant on open, smooth on user keys)
-  const alignCategoryBar = useCallback((smooth = false, grp = activeGroup) => {
+  const alignCategoryBar = useCallback((smooth = false, grp?: string) => {
     const container = categoryBarRef.current;
     if (!container) return;
-    const catIdx = groups.indexOf(grp);
+    const targetGrp = grp !== undefined ? grp : activeGroupRef.current;
+    const catIdx = groups.indexOf(targetGrp);
     if (catIdx >= 0 && container.children[catIdx]) {
       const btn = container.children[catIdx] as HTMLElement;
       const targetLeft = Math.max(0, btn.offsetLeft - (container.clientWidth / 2) + (btn.clientWidth / 2));
@@ -266,14 +282,15 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         container.scrollLeft = targetLeft;
       }
     }
-  }, [groups, activeGroup]);
+  }, [groups]);
 
   // Helper: center active day selector tab (instant on open, smooth on user keys)
-  const alignDaySelector = useCallback((smooth = false, offset = selectedDayOffset) => {
+  const alignDaySelector = useCallback((smooth = false, offset?: number) => {
     const container = daySelectorRef.current;
     if (!container) return;
     const dayOffsets = [-7, -6, -5, -4, -3, -2, -1, 0, 1];
-    const dayIdx = dayOffsets.indexOf(offset);
+    const targetOffset = offset !== undefined ? offset : selectedDayOffsetRef.current;
+    const dayIdx = dayOffsets.indexOf(targetOffset);
     if (dayIdx >= 0 && container.children[dayIdx]) {
       const btn = container.children[dayIdx] as HTMLElement;
       const targetLeft = Math.max(0, btn.offsetLeft - (container.clientWidth / 2) + (btn.clientWidth / 2));
@@ -283,25 +300,27 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         container.scrollLeft = targetLeft;
       }
     }
-  }, [selectedDayOffset]);
+  }, []);
 
   // Helper: center focused channel item
-  const alignChannelList = useCallback((smooth = false, chIdx = focusedChannelIndex) => {
+  const alignChannelList = useCallback((smooth = false, chIdx?: number) => {
     const container = channelListRef.current;
     if (!container) return;
-    const targetTop = Math.max(0, chIdx * CHANNEL_ITEM_HEIGHT - (container.clientHeight / 2) + (CHANNEL_ITEM_HEIGHT / 2));
+    const targetIdx = chIdx !== undefined ? chIdx : focusedChannelIndexRef.current;
+    const targetTop = Math.max(0, targetIdx * CHANNEL_ITEM_HEIGHT - (container.clientHeight / 2) + (CHANNEL_ITEM_HEIGHT / 2));
     if (smooth) {
       container.scrollTo({ top: targetTop, behavior: 'smooth' });
     } else {
       container.scrollTop = targetTop;
     }
-  }, [focusedChannelIndex, CHANNEL_ITEM_HEIGHT]);
+  }, [CHANNEL_ITEM_HEIGHT]);
 
   // Helper: center focused program item
-  const alignEpgList = useCallback((smooth = false, progIdx = focusedProgramIndex) => {
+  const alignEpgList = useCallback((smooth = false, progIdx?: number) => {
     const container = epgListRef.current;
     if (!container) return;
-    const itemEl = document.getElementById(`epg-item-${progIdx}`);
+    const targetIdx = progIdx !== undefined ? progIdx : focusedProgramIndexRef.current;
+    const itemEl = document.getElementById(`epg-item-${targetIdx}`);
     if (itemEl) {
       const targetTop = Math.max(0, itemEl.offsetTop - (container.clientHeight / 2) + (itemEl.clientHeight / 2));
       if (smooth) {
@@ -310,7 +329,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         container.scrollTop = targetTop;
       }
     }
-  }, [focusedProgramIndex]);
+  }, []);
 
   // Whenever selectedChannel changes, fetch REAL EPG from backend (with in-memory cache)
   useEffect(() => {
@@ -517,25 +536,41 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }
   }, [focusedProgramIndex, overlayMode, alignEpgList]);
 
-  // When filteredEpg loads or date changes, focus current live/nearest program
+  // Clear lastEpgFocusKeyRef when exiting EPG overlay so re-opening it will re-focus the live program
   useEffect(() => {
-    if (overlayMode === 'epg' && filteredEpg.length > 0) {
-      const now = Date.now();
-      const liveIdx = filteredEpg.findIndex(p => p.isLive || (p.start <= now && p.end > now));
-      let targetIdx = 0;
-      if (liveIdx !== -1) {
-        targetIdx = liveIdx;
-      } else {
-        const upcomingIdx = filteredEpg.findIndex(p => p.start >= now);
-        targetIdx = upcomingIdx !== -1 ? upcomingIdx : 0;
-      }
-      setFocusedProgramIndex(targetIdx);
+    if (overlayMode !== 'epg') {
+      lastEpgFocusKeyRef.current = '';
+    }
+  }, [overlayMode]);
 
+  // When opening EPG overlay or changing date/channel, auto-focus current live/first program ONCE
+  useEffect(() => {
+    if (overlayMode !== 'epg' || filteredEpg.length === 0) return;
+
+    const currentKey = `${selectedChannel?.id}_${selectedDayOffset}`;
+    if (lastEpgFocusKeyRef.current !== currentKey) {
+      lastEpgFocusKeyRef.current = currentKey;
+
+      const now = Date.now();
+      let targetIdx = 0;
+      if (selectedDayOffset === 0) {
+        const liveIdx = filteredEpg.findIndex(p => p.isLive || (p.start <= now && p.end > now));
+        if (liveIdx !== -1) {
+          targetIdx = liveIdx;
+        } else {
+          const upcomingIdx = filteredEpg.findIndex(p => p.start >= now);
+          targetIdx = upcomingIdx !== -1 ? upcomingIdx : 0;
+        }
+      } else {
+        targetIdx = 0;
+      }
+
+      setFocusedProgramIndex(targetIdx);
       setTimeout(() => {
         alignEpgList(false, targetIdx);
       }, 40);
     }
-  }, [overlayMode, selectedDayOffset, filteredEpg.length, alignEpgList]);
+  }, [overlayMode, selectedDayOffset, selectedChannel?.id, filteredEpg.length, alignEpgList]);
 
   // Stream Playback Handler with HLS.js
   const playStream = useCallback((streamUrl: string) => {
@@ -1325,6 +1360,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           <div
             ref={categoryBarRef}
             style={{
+              position: 'relative',
               display: 'flex',
               gap: '6px',
               padding: '10px 16px',
@@ -1567,6 +1603,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           <div
             ref={daySelectorRef}
             style={{
+              position: 'relative',
               display: 'flex',
               gap: '6px',
               padding: '10px 16px',
@@ -1629,6 +1666,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             ref={epgListRef}
             style={{
               flex: 1,
+              position: 'relative',
               overflowY: 'auto',
               padding: '12px',
               display: 'flex',
