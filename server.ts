@@ -385,10 +385,22 @@ app.post('/api/iptv/epg/sync', async (req, res) => {
   }
 });
 
-app.get('/api/iptv/channels', async (req, res) => {
-  const targetUrl = (req.query.url as string) || iptvSettings.playlistUrl;
-  if (!targetUrl) {
-    return res.json([]);
+// In-memory and disk cache for IPTV channels
+const PLAYLIST_CACHE_FILE = path.join(path.resolve(__dirname, 'iptv-cache'), 'playlist-channels.json');
+let cachedChannels: any[] = [];
+let lastPlaylistFetchTime = 0;
+
+try {
+  if (fs.existsSync(PLAYLIST_CACHE_FILE)) {
+    cachedChannels = JSON.parse(fs.readFileSync(PLAYLIST_CACHE_FILE, 'utf8'));
+    console.log(`[IPTV Server] Loaded ${cachedChannels.length} channels from disk cache.`);
+  }
+} catch (e) {}
+
+async function fetchAndCacheChannels(targetUrl: string, force = false): Promise<any[]> {
+  if (!targetUrl) return cachedChannels;
+  if (!force && cachedChannels.length > 0 && Date.now() - lastPlaylistFetchTime < 600000) {
+    return cachedChannels;
   }
 
   try {
@@ -396,7 +408,7 @@ app.get('/api/iptv/channels', async (req, res) => {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
       },
-      signal: AbortSignal.timeout(8000)
+      signal: AbortSignal.timeout(25000)
     });
 
     if (response.ok) {
@@ -442,15 +454,44 @@ app.get('/api/iptv/channels', async (req, res) => {
         }
 
         if (channels.length > 0) {
-          return res.json(channels);
+          cachedChannels = channels;
+          lastPlaylistFetchTime = Date.now();
+          console.log(`[IPTV Server] Successfully parsed and cached ${channels.length} channels from playlist!`);
+          fs.promises.writeFile(PLAYLIST_CACHE_FILE, JSON.stringify(channels), 'utf8').catch(() => {});
+          return channels;
         }
       }
     }
-  } catch (e) {
-    // Return empty array on failure so frontend falls back to sample channels
+  } catch (err: any) {
+    console.warn('[IPTV Server] Error refreshing playlist:', err?.message || err);
   }
 
-  return res.json([]);
+  return cachedChannels;
+}
+
+// Trigger initial playlist fetch on server boot
+if (iptvSettings.playlistUrl) {
+  fetchAndCacheChannels(iptvSettings.playlistUrl).catch(() => {});
+}
+
+app.get('/api/iptv/channels', async (req, res) => {
+  const targetUrl = (req.query.url as string) || iptvSettings.playlistUrl;
+  if (!targetUrl && cachedChannels.length > 0) {
+    return res.json(cachedChannels);
+  }
+
+  // Instant response if channels are already in cache
+  if (cachedChannels.length > 0 && (!req.query.url || req.query.url === iptvSettings.playlistUrl)) {
+    res.json(cachedChannels);
+    // Background refresh if older than 10 minutes
+    if (Date.now() - lastPlaylistFetchTime > 600000) {
+      fetchAndCacheChannels(targetUrl).catch(() => {});
+    }
+    return;
+  }
+
+  const channels = await fetchAndCacheChannels(targetUrl, true);
+  res.json(channels);
 });
 
 async function startServer() {

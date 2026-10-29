@@ -215,40 +215,33 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   }, []);
 
   // Fetch or load channels
-  const loadChannels = useCallback(async (playlistUrl: string) => {
+  const loadChannels = useCallback(async (playlistUrl: string, retryCount = 1) => {
     setIsLoadingStream(true);
     setPlayerError(null);
     try {
-      const response = await fetch(`/api/iptv/channels?url=${encodeURIComponent(playlistUrl)}`);
+      const response = await fetch(`/api/iptv/channels?url=${encodeURIComponent(playlistUrl || '')}`);
       if (response.ok) {
         const data = await response.json();
         if (Array.isArray(data) && data.length > 0) {
           setChannels(data);
-          setSelectedChannel(data[0]);
-          setFocusedChannelIndex(0);
+          setSelectedChannel(prev => {
+            if (prev) {
+              const matched = data.find(c => c.id === prev.id || c.name === prev.name);
+              if (matched) return matched;
+            }
+            return data[0];
+          });
           return;
         }
       }
-      throw new Error('Fallback to default sample channels');
-    } catch (e) {
-      const sampleM3u = `#EXTM3U url-tvg="http://epg.it999.ru/edem.xml.gz" catchup="shift" catchup-days="7"
-#EXTINF:-1 tvg-id="1" tvg-name="Первый Канал HD" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/1/12/Perviy_Kanal_logo_2012.svg/300px-Perviy_Kanal_logo_2012.svg.png" group-title="Общие",Первый Канал HD
-https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8
-#EXTINF:-1 tvg-id="2" tvg-name="Россия 1 HD" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/thumb/6/69/Rossiya_1_logo_2012.svg/300px-Rossiya_1_logo_2012.svg.png" group-title="Общие",Россия 1 HD
-https://test-streams.mux.dev/test_001/stream.m3u8
-#EXTINF:-1 tvg-id="3" tvg-name="Кинопремьера HD" tvg-logo="https://cdn-icons-png.flaticon.com/512/2798/2798007.png" group-title="Кино",Кинопремьера HD
-https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8
-#EXTINF:-1 tvg-id="4" tvg-name="Матч ТВ HD" tvg-logo="https://cdn-icons-png.flaticon.com/512/861/861512.png" group-title="Спорт",Матч ТВ HD
-https://test-streams.mux.dev/test_001/stream.m3u8
-#EXTINF:-1 tvg-id="5" tvg-name="Discovery Channel" tvg-logo="https://cdn-icons-png.flaticon.com/512/2991/2991148.png" group-title="Познавательные",Discovery Channel HD
-https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8
-#EXTINF:-1 tvg-id="6" tvg-name="ТНТ HD" tvg-logo="https://cdn-icons-png.flaticon.com/512/3845/3845874.png" group-title="Развлекательные",ТНТ HD
-https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
-
-      const parsed = parseM3uPlaylist(sampleM3u, 7);
-      setChannels(parsed);
-      setSelectedChannel(parsed[0]);
-      setFocusedChannelIndex(0);
+      throw new Error('Playlist returned empty');
+    } catch (e: any) {
+      console.warn('[IptvPlayer] Error loading channels:', e);
+      if (retryCount <= 4) {
+        setTimeout(() => loadChannels(playlistUrl, retryCount + 1), 2000);
+      } else {
+        showToast('Не удалось загрузить список каналов. Проверьте сеть или настройки.');
+      }
     } finally {
       setIsLoadingStream(false);
     }
@@ -383,25 +376,91 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
     };
   }, [selectedChannel, selectedDayOffset]);
 
-  // AUTO-SCROLL FOR CATEGORY TABS (Ensures active tab remains visible on TV screen)
+  // INSTANT AUTO-ALIGNMENT ON OVERLAY OPEN
+  // When opening channels or epg drawer, immediately center categories, channels, dates, and programs
+  useEffect(() => {
+    if (overlayMode === 'channels') {
+      const alignChannelsOnOpen = () => {
+        // 1. Center active category tab
+        const catBtn = document.getElementById(`cat-btn-${encodeURIComponent(activeGroup)}`);
+        if (catBtn) {
+          catBtn.scrollIntoView({ behavior: 'auto', inline: 'center', block: 'nearest' });
+        }
+
+        // 2. Center focused channel in list
+        const container = channelListRef.current;
+        const itemEl = document.getElementById(`ch-item-${focusedChannelIndex}`);
+        if (container && itemEl) {
+          const cHeight = container.clientHeight;
+          const iTop = itemEl.offsetTop;
+          const iHeight = itemEl.clientHeight;
+          container.scrollTo({ top: Math.max(0, iTop - (cHeight / 2) + (iHeight / 2)), behavior: 'auto' });
+        }
+      };
+
+      alignChannelsOnOpen();
+      const r1 = requestAnimationFrame(alignChannelsOnOpen);
+      const t1 = setTimeout(alignChannelsOnOpen, 40);
+      const t2 = setTimeout(alignChannelsOnOpen, 120);
+
+      return () => {
+        cancelAnimationFrame(r1);
+        clearTimeout(t1);
+        clearTimeout(t2);
+      };
+    }
+
+    if (overlayMode === 'epg') {
+      const alignEpgOnOpen = () => {
+        // 1. Center active day selector tab (e.g. Сегодня)
+        const dayBtn = document.getElementById(`day-btn-${selectedDayOffset}`);
+        if (dayBtn) {
+          dayBtn.scrollIntoView({ behavior: 'auto', inline: 'center', block: 'nearest' });
+        }
+
+        // 2. Center focused program in schedule list
+        const container = epgListRef.current;
+        const itemEl = document.getElementById(`epg-item-${focusedProgramIndex}`);
+        if (container && itemEl) {
+          const cHeight = container.clientHeight;
+          const iTop = itemEl.offsetTop;
+          const iHeight = itemEl.clientHeight;
+          container.scrollTo({ top: Math.max(0, iTop - (cHeight / 2) + (iHeight / 2)), behavior: 'auto' });
+        }
+      };
+
+      alignEpgOnOpen();
+      const r1 = requestAnimationFrame(alignEpgOnOpen);
+      const t1 = setTimeout(alignEpgOnOpen, 40);
+      const t2 = setTimeout(alignEpgOnOpen, 120);
+
+      return () => {
+        cancelAnimationFrame(r1);
+        clearTimeout(t1);
+        clearTimeout(t2);
+      };
+    }
+  }, [overlayMode]);
+
+  // AUTO-SCROLL FOR CATEGORY TABS (Smooth tracking on user navigation)
   useEffect(() => {
     if (overlayMode !== 'channels') return;
     const itemEl = document.getElementById(`cat-btn-${encodeURIComponent(activeGroup)}`);
     if (itemEl) {
       itemEl.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
     }
-  }, [activeGroup, overlayMode]);
+  }, [activeGroup]);
 
-  // AUTO-SCROLL FOR EPG DAY SELECTOR TABS (Ensures active date remains visible on TV screen)
+  // AUTO-SCROLL FOR EPG DAY SELECTOR TABS (Smooth tracking on user navigation)
   useEffect(() => {
     if (overlayMode !== 'epg') return;
     const itemEl = document.getElementById(`day-btn-${selectedDayOffset}`);
     if (itemEl) {
       itemEl.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
     }
-  }, [selectedDayOffset, overlayMode]);
+  }, [selectedDayOffset]);
 
-  // SMART AUTO-SCROLL FOR CHANNELS (Maintains focus in middle, stops at ends)
+  // SMART AUTO-SCROLL FOR CHANNELS (Smooth tracking on user navigation)
   useEffect(() => {
     if (overlayMode !== 'channels') return;
     const container = channelListRef.current;
@@ -414,9 +473,9 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
       const targetScroll = iTop - (cHeight / 2) + (iHeight / 2);
       container.scrollTo({ top: Math.max(0, targetScroll), behavior: 'smooth' });
     }
-  }, [focusedChannelIndex, overlayMode]);
+  }, [focusedChannelIndex]);
 
-  // SMART AUTO-SCROLL FOR EPG PROGRAMS (Maintains focus in middle, stops at ends)
+  // SMART AUTO-SCROLL FOR EPG PROGRAMS (Smooth tracking on user navigation)
   useEffect(() => {
     if (overlayMode !== 'epg') return;
     const container = epgListRef.current;
@@ -429,21 +488,34 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
       const targetScroll = iTop - (cHeight / 2) + (iHeight / 2);
       container.scrollTo({ top: Math.max(0, targetScroll), behavior: 'smooth' });
     }
-  }, [focusedProgramIndex, overlayMode]);
+  }, [focusedProgramIndex]);
 
-  // Automatically focus on the current live program (or nearest broadcast) when opening EPG
+  // Automatically focus & center the current live program when EPG loads or date changes
   useEffect(() => {
     if (overlayMode === 'epg' && filteredEpg.length > 0) {
-      const liveIdx = filteredEpg.findIndex(p => p.isLive);
+      const now = Date.now();
+      const liveIdx = filteredEpg.findIndex(p => p.isLive || (p.start <= now && p.end > now));
+      let targetIdx = 0;
       if (liveIdx !== -1) {
-        setFocusedProgramIndex(liveIdx);
+        targetIdx = liveIdx;
       } else {
-        const now = Date.now();
-        const nearestIdx = filteredEpg.findIndex(p => p.end > now);
-        setFocusedProgramIndex(nearestIdx !== -1 ? nearestIdx : Math.max(0, filteredEpg.length - 1));
+        const upcomingIdx = filteredEpg.findIndex(p => p.start >= now);
+        targetIdx = upcomingIdx !== -1 ? upcomingIdx : 0;
       }
+      setFocusedProgramIndex(targetIdx);
+
+      setTimeout(() => {
+        const container = epgListRef.current;
+        const itemEl = document.getElementById(`epg-item-${targetIdx}`);
+        if (container && itemEl) {
+          const cHeight = container.clientHeight;
+          const iTop = itemEl.offsetTop;
+          const iHeight = itemEl.clientHeight;
+          container.scrollTo({ top: Math.max(0, iTop - (cHeight / 2) + (iHeight / 2)), behavior: 'auto' });
+        }
+      }, 30);
     }
-  }, [overlayMode, selectedChannel?.id, selectedDayOffset, filteredEpg.length]);
+  }, [overlayMode, selectedDayOffset, filteredEpg.length]);
 
   // Stream Playback Handler with HLS.js
   const playStream = useCallback((streamUrl: string) => {
@@ -718,11 +790,14 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
         switch (action) {
           case 'OK':
           case 'UP':
-            setOverlayMode('channels');
             if (selectedChannel) {
-              const idx = filteredChannels.findIndex(c => c.id === selectedChannel.id);
-              if (idx !== -1) setFocusedChannelIndex(idx);
+              const grp = selectedChannel.group || 'Все';
+              setActiveGroup(grp);
+              const curList = grp === 'Все' ? channels : channels.filter(c => c.group === grp);
+              const idx = curList.findIndex(c => c.id === selectedChannel.id);
+              setFocusedChannelIndex(idx !== -1 ? idx : 0);
             }
+            setOverlayMode('channels');
             break;
 
           case 'DOWN':
@@ -808,8 +883,8 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             if (filteredChannels[focusedChannelIndex]) {
               const ch = filteredChannels[focusedChannelIndex];
               setSelectedChannel(ch);
+              setSelectedDayOffset(0);
               setOverlayMode('epg');
-              setFocusedProgramIndex(0);
             }
             break;
 
@@ -1301,6 +1376,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                     onClick={() => {
                       setSelectedChannel(channel);
                       setFocusedChannelIndex(actualIndex);
+                      setSelectedDayOffset(0);
                       setOverlayMode('epg');
                     }}
                     style={{
