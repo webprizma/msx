@@ -27,9 +27,14 @@ try {
   }
 } catch (e) {}
 
+// Ensure updated 7-day EPG URL
+if (!iptvSettings.epgUrl || iptvSettings.epgUrl.includes('1.1.xml')) {
+  iptvSettings.epgUrl = 'https://rus.epg.team/7.1.xml?pkg=442';
+}
+
 // Initialize disk-cached EPG & trigger background sync
 initEpgCache();
-syncEpg(iptvSettings.epgUrl || 'https://rus.epg.team/1.1.xml').catch(err => {
+syncEpg(iptvSettings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442').catch(err => {
   console.warn('[EPG Background Sync Notice]:', err?.message || err);
 });
 

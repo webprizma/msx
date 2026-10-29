@@ -1,17 +1,17 @@
 import fs from 'fs';
 import path from 'path';
+import zlib from 'zlib';
 import { fileURLToPath } from 'url';
 import type { EpgProgram } from '../types/iptv.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CACHE_DIR = path.resolve(__dirname, '../../iptv-cache');
-const CACHE_FILE = path.join(CACHE_DIR, 'epg-data.json');
+const CACHE_FILE_GZ = path.join(CACHE_DIR, 'epg-data.json.gz');
 
-// Memory cache for fast lookups
-// Key: channel id or normalized channel name -> Array of EpgProgram
+// In-memory cache for ultra-fast lookups
 const programsByChannel = new Map<string, EpgProgram[]>();
-const channelAliases = new Map<string, string>(); // name.toLowerCase() -> tvgId
+const channelAliases = new Map<string, string>(); // normalized name -> tvgId
 let isSyncing = false;
 let lastSyncTime = 0;
 let totalProgrammesCount = 0;
@@ -51,33 +51,61 @@ function normalizeName(name: string): string {
   return name.toLowerCase().replace(/[\s\-_!?:.,/\\()[\]]+/g, '').trim();
 }
 
-// Load cache from disk if available
+// Compact program array format: [start, end, title, category, description]
+type CompactProgram = [number, number, string, string, string];
+
+// Initialize cache from disk (fast gzipped snapshot, ~4MB instead of 230MB)
 export function initEpgCache() {
   try {
     if (!fs.existsSync(CACHE_DIR)) {
       fs.mkdirSync(CACHE_DIR, { recursive: true });
     }
-    if (fs.existsSync(CACHE_FILE)) {
-      const raw = fs.readFileSync(CACHE_FILE, 'utf8');
-      const parsed = JSON.parse(raw);
+
+    if (fs.existsSync(CACHE_FILE_GZ)) {
+      const gzipped = fs.readFileSync(CACHE_FILE_GZ);
+      const jsonStr = zlib.gunzipSync(gzipped).toString('utf8');
+      const parsed = JSON.parse(jsonStr);
+
       if (parsed && typeof parsed === 'object') {
+        const now = Date.now();
         let count = 0;
-        for (const [k, v] of Object.entries(parsed)) {
-          if (Array.isArray(v)) {
-            programsByChannel.set(k, v);
-            count += v.length;
+
+        if (parsed.aliases && typeof parsed.aliases === 'object') {
+          for (const [k, v] of Object.entries(parsed.aliases)) {
+            channelAliases.set(k, String(v));
           }
         }
+
+        if (parsed.channels && typeof parsed.channels === 'object') {
+          for (const [chId, rawList] of Object.entries(parsed.channels)) {
+            if (Array.isArray(rawList)) {
+              const restored: EpgProgram[] = (rawList as CompactProgram[]).map(([start, end, title, cat, desc]) => ({
+                id: `epg-${chId}-${start}`,
+                channelId: chId,
+                title,
+                description: desc,
+                category: cat,
+                start,
+                end,
+                isLive: now >= start && now < end,
+                hasArchive: end <= now
+              }));
+              programsByChannel.set(chId, restored);
+              count += restored.length;
+            }
+          }
+        }
+
         totalProgrammesCount = count;
-        console.log(`[EPG Service] Loaded cached EPG for ${programsByChannel.size} channels (${count} programs) from disk.`);
+        console.log(`[EPG Service] Loaded ${count} programs for ${programsByChannel.size} channels from gzipped cache.`);
       }
     }
   } catch (e) {
-    console.error('[EPG Service] Error loading disk cache:', e);
+    console.warn('[EPG Service] Notice loading disk cache:', e);
   }
 }
 
-// Fetch and stream parse XMLTV file from provider (TV.Team, etc.)
+// Background sync from XMLTV URL (e.g. https://rus.epg.team/7.1.xml?pkg=442)
 export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg=442'): Promise<{ success: boolean; channelsCount: number; message: string }> {
   if (isSyncing) {
     return { success: false, channelsCount: programsByChannel.size, message: 'Синхронизация уже выполняется...' };
@@ -91,7 +119,7 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
       },
-      signal: AbortSignal.timeout(60000)
+      signal: AbortSignal.timeout(90000)
     });
 
     if (!response.ok || !response.body) {
@@ -102,8 +130,8 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
     const tempMap = new Map<string, EpgProgram[]>();
-    const tempAliases = new Map<string, string>();
     let totalProgrammes = 0;
+    let lastFlushTime = Date.now();
 
     while (true) {
       const { done, value } = await reader.read();
@@ -117,10 +145,10 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
       while ((chMatch = chRegex.exec(buffer)) !== null) {
         const chId = chMatch[1];
         const chName = decodeXmlEntities(chMatch[2]).trim();
-        tempAliases.set(normalizeName(chName), chId);
+        channelAliases.set(normalizeName(chName), chId);
       }
 
-      // 2. Extract programmes <programme ...> ... </programme> regardless of attribute order
+      // 2. Extract programmes <programme ...> ... </programme>
       let progMatch;
       const progRegex = /<programme\s+([^>]+)>([\s\S]*?)<\/programme>/gi;
       let lastIndex = 0;
@@ -146,7 +174,8 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
         const catMatch = inner.match(/<category[^>]*>([\s\S]*?)<\/category>/i);
 
         const title = decodeXmlEntities(titleMatch ? titleMatch[1].trim() : 'Передача');
-        const desc = decodeXmlEntities(descMatch ? descMatch[1].trim() : '');
+        const rawDesc = decodeXmlEntities(descMatch ? descMatch[1].trim() : '');
+        const desc = rawDesc.length > 200 ? rawDesc.slice(0, 200) + '...' : rawDesc;
         const category = decodeXmlEntities(catMatch ? catMatch[1].trim() : 'ТВ');
 
         const now = Date.now();
@@ -169,11 +198,20 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
         totalProgrammes++;
       }
 
-      // Keep only unprocessed buffer remainder
+      // Incrementally flush parsed channels to main map every 1s so early channels (ch001, ch002...)
+      // become immediately available without waiting for full download!
+      if (Date.now() - lastFlushTime > 1000) {
+        for (const [chId, list] of tempMap.entries()) {
+          programsByChannel.set(chId, list);
+        }
+        totalProgrammesCount = totalProgrammes;
+        lastFlushTime = Date.now();
+      }
+
+      // Retain unparsed chunk remainder
       if (lastIndex > 0) {
         buffer = buffer.slice(lastIndex);
-      } else if (buffer.length > 500000) {
-        // Prevent buffer from growing unbounded if no complete tag found
+      } else if (buffer.length > 400000) {
         const safeCut = buffer.lastIndexOf('</programme>');
         if (safeCut !== -1) {
           buffer = buffer.slice(safeCut + 12);
@@ -181,30 +219,34 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
       }
     }
 
-    // Sort programmes by time for each channel
+    // Sort programmes by start time for all channels
     for (const [chId, list] of tempMap.entries()) {
       list.sort((a, b) => a.start - b.start);
       programsByChannel.set(chId, list);
     }
-    for (const [normName, chId] of tempAliases.entries()) {
-      channelAliases.set(normName, chId);
-    }
 
     lastSyncTime = Date.now();
     totalProgrammesCount = totalProgrammes;
-    console.log(`[EPG Service] Successfully indexed ${totalProgrammes} real programmes for ${tempMap.size} channels!`);
+    console.log(`[EPG Service] Successfully indexed ${totalProgrammes} programmes for ${tempMap.size} channels!`);
 
-    // Persist snapshot to disk asynchronously without blocking event loop
+    // Asynchronously save compact gzipped snapshot to disk (~4MB)
     try {
-      const diskObj: Record<string, EpgProgram[]> = {};
-      for (const [k, v] of programsByChannel.entries()) {
-        diskObj[k] = v;
+      const compactChannels: Record<string, CompactProgram[]> = {};
+      for (const [k, progs] of programsByChannel.entries()) {
+        compactChannels[k] = progs.map(p => [p.start, p.end, p.title || '', p.category || '', p.description || '']);
       }
-      fs.promises.writeFile(CACHE_FILE, JSON.stringify(diskObj), 'utf8').catch(saveErr => {
-        console.warn('[EPG Service] Could not write cache to disk:', saveErr);
+
+      const snapshot = {
+        aliases: Object.fromEntries(channelAliases),
+        channels: compactChannels
+      };
+
+      const compressed = zlib.gzipSync(Buffer.from(JSON.stringify(snapshot), 'utf8'));
+      fs.promises.writeFile(CACHE_FILE_GZ, compressed).catch(err => {
+        console.warn('[EPG Service] Could not write compressed cache:', err);
       });
     } catch (saveErr) {
-      console.warn('[EPG Service] Could not prepare cache for disk:', saveErr);
+      console.warn('[EPG Service] Could not prepare compressed cache:', saveErr);
     }
 
     return {
@@ -220,9 +262,9 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
   }
 }
 
-// Get programs for a given channel by tvgId, tvgName, or channelName
+// Ultra-smart channel lookup supporting tvgId (ch001, ch1, 1), name, aliases, stripped suffixes
 export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[] {
-  // 1. Direct match by tvgId (exact and lowercase)
+  // 1. Direct match by tvgId
   if (tvgId) {
     if (programsByChannel.has(tvgId)) {
       return programsByChannel.get(tvgId)!;
@@ -230,6 +272,18 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
     const lowerId = tvgId.toLowerCase();
     if (programsByChannel.has(lowerId)) {
       return programsByChannel.get(lowerId)!;
+    }
+
+    // Numeric variations: ch001, ch01, ch1
+    const numMatch = tvgId.match(/\d+/);
+    if (numMatch) {
+      const num = parseInt(numMatch[0], 10);
+      const padded3 = `ch${String(num).padStart(3, '0')}`;
+      const padded2 = `ch${String(num).padStart(2, '0')}`;
+      const unpadded = `ch${num}`;
+      if (programsByChannel.has(padded3)) return programsByChannel.get(padded3)!;
+      if (programsByChannel.has(padded2)) return programsByChannel.get(padded2)!;
+      if (programsByChannel.has(unpadded)) return programsByChannel.get(unpadded)!;
     }
   }
 
@@ -246,7 +300,7 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
       return programsByChannel.get(mappedId)!;
     }
 
-    // Strip common suffixes (HD, FHD, Double, +2, +4) for fallback
+    // Strip common suffixes (HD, FHD, Double, +2, +4, +6) for fallback
     const stripped = norm.replace(/(hd|fhd|double|\+2|\+4|\+6)$/, '');
     if (stripped && stripped !== norm) {
       const fallbackId = channelAliases.get(stripped);
@@ -257,7 +311,7 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
 
     // Substring search in channel aliases
     for (const [aliasNorm, id] of channelAliases.entries()) {
-      if (aliasNorm.includes(norm) || norm.includes(aliasNorm)) {
+      if (aliasNorm === norm || (norm.length > 4 && aliasNorm.includes(norm)) || (aliasNorm.length > 4 && norm.includes(aliasNorm))) {
         if (programsByChannel.has(id)) {
           return programsByChannel.get(id)!;
         }
@@ -265,6 +319,5 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
     }
   }
 
-  // Not found in real EPG
   return [];
 }

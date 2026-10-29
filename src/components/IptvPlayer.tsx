@@ -39,6 +39,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const channelListRef = useRef<HTMLDivElement | null>(null);
   const epgListRef = useRef<HTMLDivElement | null>(null);
+  const categoryBarRef = useRef<HTMLDivElement | null>(null);
+  const daySelectorRef = useRef<HTMLDivElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
 
   const timelineHideTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -288,32 +290,82 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             setSeekTimestamp(now);
             setIsArchiveMode(false);
             setIsLoadingEpg(false);
-          } else {
-            // If empty on boot, server might still be syncing EPG cache; retry up to 3 times
-            if (attempt <= 3) {
-              retryTimer = setTimeout(() => {
-                if (!isCancelled) fetchEpg(attempt + 1);
-              }, 3000);
-            } else {
-              setEpgList([]);
-              // Default clean live program info without fake schedules
-              const fallbackLive: EpgProgram = {
-                id: `live-${selectedChannel.id}`,
-                channelId: selectedChannel.id,
-                title: selectedChannel.name,
-                description: 'Прямой эфир телеканала',
-                category: selectedChannel.group || 'ТВ',
-                start: now - 3600000,
-                end: now + 3600000,
-                isLive: true,
-                hasArchive: false
-              };
-              setCurrentPlayingProgram(fallbackLive);
-              setActiveTimelineProgram(fallbackLive);
-              setSeekTimestamp(now);
-              setIsArchiveMode(false);
-              setIsLoadingEpg(false);
+
+            // Auto-check: if no programs overlap selectedDayOffset, align to closest day with programs
+            const tzOffsetMs = 3 * 3600 * 1000;
+            const nowInMsk = new Date(Date.now() + tzOffsetMs);
+            const hasProgramsForCurrentDay = programs.some(p => {
+              const targetInMsk = new Date(nowInMsk);
+              targetInMsk.setUTCDate(targetInMsk.getUTCDate() + selectedDayOffset);
+              targetInMsk.setUTCHours(0, 0, 0, 0);
+              const start = targetInMsk.getTime() - tzOffsetMs;
+              const end = start + 24 * 3600 * 1000;
+              return p.end > start && p.start < end;
+            });
+
+            if (!hasProgramsForCurrentDay) {
+              for (const off of [0, -1, 1, -2, -3, -4, -5, -6, -7]) {
+                const targetInMsk = new Date(nowInMsk);
+                targetInMsk.setUTCDate(targetInMsk.getUTCDate() + off);
+                targetInMsk.setUTCHours(0, 0, 0, 0);
+                const s = targetInMsk.getTime() - tzOffsetMs;
+                const e = s + 24 * 3600 * 1000;
+                if (programs.some(p => p.end > s && p.start < e)) {
+                  setSelectedDayOffset(off);
+                  break;
+                }
+              }
             }
+          } else {
+            // Check if server is still syncing EPG in background
+            fetch('/api/iptv/epg/status')
+              .then(res => (res.ok ? res.json() : null))
+              .then(status => {
+                if (isCancelled) return;
+                const isSyncing = status?.isSyncing ?? false;
+
+                if (isSyncing && attempt <= 20) {
+                  // Keep polling every 1.5s while server is downloading / parsing EPG
+                  retryTimer = setTimeout(() => {
+                    if (!isCancelled) fetchEpg(attempt + 1);
+                  }, 1500);
+                } else if (attempt <= 4) {
+                  // Retry up to 4 times for initial boot
+                  retryTimer = setTimeout(() => {
+                    if (!isCancelled) fetchEpg(attempt + 1);
+                  }, 2000);
+                } else {
+                  // Truly no EPG for this channel
+                  setEpgList([]);
+                  const fallbackLive: EpgProgram = {
+                    id: `live-${selectedChannel.id}`,
+                    channelId: selectedChannel.id,
+                    title: selectedChannel.name,
+                    description: 'Прямой эфир телеканала',
+                    category: selectedChannel.group || 'ТВ',
+                    start: now - 3600000,
+                    end: now + 3600000,
+                    isLive: true,
+                    hasArchive: false
+                  };
+                  setCurrentPlayingProgram(fallbackLive);
+                  setActiveTimelineProgram(fallbackLive);
+                  setSeekTimestamp(now);
+                  setIsArchiveMode(false);
+                  setIsLoadingEpg(false);
+                }
+              })
+              .catch(() => {
+                if (isCancelled) return;
+                if (attempt <= 4) {
+                  retryTimer = setTimeout(() => {
+                    if (!isCancelled) fetchEpg(attempt + 1);
+                  }, 2000);
+                } else {
+                  setEpgList([]);
+                  setIsLoadingEpg(false);
+                }
+              });
           }
         })
         .catch(() => {
@@ -329,7 +381,25 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
       isCancelled = true;
       if (retryTimer) clearTimeout(retryTimer);
     };
-  }, [selectedChannel]);
+  }, [selectedChannel, selectedDayOffset]);
+
+  // AUTO-SCROLL FOR CATEGORY TABS (Ensures active tab remains visible on TV screen)
+  useEffect(() => {
+    if (overlayMode !== 'channels') return;
+    const itemEl = document.getElementById(`cat-btn-${encodeURIComponent(activeGroup)}`);
+    if (itemEl) {
+      itemEl.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+    }
+  }, [activeGroup, overlayMode]);
+
+  // AUTO-SCROLL FOR EPG DAY SELECTOR TABS (Ensures active date remains visible on TV screen)
+  useEffect(() => {
+    if (overlayMode !== 'epg') return;
+    const itemEl = document.getElementById(`day-btn-${selectedDayOffset}`);
+    if (itemEl) {
+      itemEl.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+    }
+  }, [selectedDayOffset, overlayMode]);
 
   // SMART AUTO-SCROLL FOR CHANNELS (Maintains focus in middle, stops at ends)
   useEffect(() => {
@@ -714,8 +784,11 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             {
               const curGrpIdx = groups.indexOf(activeGroup);
               const nextGrpIdx = (curGrpIdx - 1 + groups.length) % groups.length;
-              setActiveGroup(groups[nextGrpIdx]);
+              const nextGrp = groups[nextGrpIdx];
+              setActiveGroup(nextGrp);
               setFocusedChannelIndex(0);
+              const btn = document.getElementById(`cat-btn-${encodeURIComponent(nextGrp)}`);
+              if (btn) btn.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
             }
             break;
 
@@ -723,8 +796,11 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             {
               const curGrpIdx = groups.indexOf(activeGroup);
               const nextGrpIdx = (curGrpIdx + 1) % groups.length;
-              setActiveGroup(groups[nextGrpIdx]);
+              const nextGrp = groups[nextGrpIdx];
+              setActiveGroup(nextGrp);
               setFocusedChannelIndex(0);
+              const btn = document.getElementById(`cat-btn-${encodeURIComponent(nextGrp)}`);
+              if (btn) btn.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
             }
             break;
 
@@ -756,13 +832,23 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             break;
 
           case 'LEFT':
-            setSelectedDayOffset(prev => Math.max(-7, prev - 1));
-            setFocusedProgramIndex(0);
+            {
+              const nextOffset = Math.max(-7, selectedDayOffset - 1);
+              setSelectedDayOffset(nextOffset);
+              setFocusedProgramIndex(0);
+              const btn = document.getElementById(`day-btn-${nextOffset}`);
+              if (btn) btn.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+            }
             break;
 
           case 'RIGHT':
-            setSelectedDayOffset(prev => Math.min(1, prev + 1));
-            setFocusedProgramIndex(0);
+            {
+              const nextOffset = Math.min(1, selectedDayOffset + 1);
+              setSelectedDayOffset(nextOffset);
+              setFocusedProgramIndex(0);
+              const btn = document.getElementById(`day-btn-${nextOffset}`);
+              if (btn) btn.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+            }
             break;
 
           case 'OK':
@@ -1146,36 +1232,45 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
 
           {/* Category Tabs */}
           <div
+            ref={categoryBarRef}
             style={{
               display: 'flex',
               gap: '6px',
               padding: '10px 16px',
               overflowX: 'auto',
-              borderBottom: '1px solid rgba(51, 65, 85, 0.5)'
+              borderBottom: '1px solid rgba(51, 65, 85, 0.5)',
+              scrollbarWidth: 'none',
+              scrollBehavior: 'smooth'
             }}
           >
-            {groups.map((group) => (
-              <button
-                key={group}
-                onClick={() => {
-                  setActiveGroup(group);
-                  setFocusedChannelIndex(0);
-                }}
-                style={{
-                  padding: '6px 12px',
-                  borderRadius: '8px',
-                  fontSize: '11px',
-                  fontWeight: activeGroup === group ? 'bold' : 'normal',
-                  whiteSpace: 'nowrap',
-                  cursor: 'pointer',
-                  border: 'none',
-                  backgroundColor: activeGroup === group ? '#0284c7' : 'rgba(30, 41, 59, 0.8)',
-                  color: activeGroup === group ? '#ffffff' : '#94a3b8'
-                }}
-              >
-                {group}
-              </button>
-            ))}
+            {groups.map((group) => {
+              const isSelected = activeGroup === group;
+              return (
+                <button
+                  key={group}
+                  id={`cat-btn-${encodeURIComponent(group)}`}
+                  onClick={() => {
+                    setActiveGroup(group);
+                    setFocusedChannelIndex(0);
+                  }}
+                  style={{
+                    padding: '7px 14px',
+                    borderRadius: '8px',
+                    fontSize: '12px',
+                    fontWeight: isSelected ? 'bold' : 'normal',
+                    whiteSpace: 'nowrap',
+                    cursor: 'pointer',
+                    border: isSelected ? '2px solid #38bdf8' : '1px solid transparent',
+                    backgroundColor: isSelected ? '#0284c7' : 'rgba(30, 41, 59, 0.8)',
+                    color: isSelected ? '#ffffff' : '#94a3b8',
+                    boxShadow: isSelected ? '0 0 12px rgba(56, 189, 248, 0.5)' : 'none',
+                    transition: 'all 0.15s ease'
+                  }}
+                >
+                  {group}
+                </button>
+              );
+            })}
           </div>
 
           {/* Channel Items List: High-Performance Virtualized Windowed Renderer */}
@@ -1379,18 +1474,25 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
 
           {/* 7-Day Selector Bar */}
           <div
+            ref={daySelectorRef}
             style={{
               display: 'flex',
               gap: '6px',
               padding: '10px 16px',
               overflowX: 'auto',
-              borderBottom: '1px solid rgba(51, 65, 85, 0.5)'
+              borderBottom: '1px solid rgba(51, 65, 85, 0.5)',
+              scrollbarWidth: 'none',
+              scrollBehavior: 'smooth'
             }}
           >
             {[-7, -6, -5, -4, -3, -2, -1, 0, 1].map((offset) => {
-              const d = new Date();
-              d.setDate(d.getDate() + offset);
-              const dayStr = d.toLocaleDateString('ru-RU', { weekday: 'short', day: 'numeric', month: 'short' });
+              const tzOffsetMs = 3 * 3600 * 1000;
+              const nowInMsk = new Date(Date.now() + tzOffsetMs);
+              const targetInMsk = new Date(nowInMsk);
+              targetInMsk.setUTCDate(targetInMsk.getUTCDate() + offset);
+              targetInMsk.setUTCHours(12, 0, 0, 0);
+              const d = new Date(targetInMsk.getTime() - tzOffsetMs);
+              const dayStr = d.toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow', weekday: 'short', day: 'numeric', month: 'short' });
 
               const label =
                 offset === 1
@@ -1407,20 +1509,23 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
               return (
                 <button
                   key={offset}
+                  id={`day-btn-${offset}`}
                   onClick={() => {
                     setSelectedDayOffset(offset);
                     setFocusedProgramIndex(0);
                   }}
                   style={{
-                    padding: '6px 12px',
+                    padding: '7px 14px',
                     borderRadius: '8px',
-                    fontSize: '11px',
+                    fontSize: '12px',
                     fontWeight: isSelected ? 'bold' : 'normal',
                     whiteSpace: 'nowrap',
                     cursor: 'pointer',
-                    border: 'none',
+                    border: isSelected ? '2px solid #38bdf8' : '1px solid transparent',
                     backgroundColor: isSelected ? '#0284c7' : 'rgba(30, 41, 59, 0.8)',
-                    color: isSelected ? '#ffffff' : '#94a3b8'
+                    color: isSelected ? '#ffffff' : '#94a3b8',
+                    boxShadow: isSelected ? '0 0 12px rgba(56, 189, 248, 0.5)' : 'none',
+                    transition: 'all 0.15s ease'
                   }}
                 >
                   {label}
@@ -1450,8 +1555,12 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             ) : filteredEpg.length === 0 ? (
               <div style={{ padding: '36px 16px', textAlign: 'center', color: '#94a3b8', fontSize: '13px' }}>
                 <Calendar style={{ width: '28px', height: '28px', margin: '0 auto 10px auto', color: '#64748b' }} />
-                <p style={{ margin: 0, fontWeight: 'bold' }}>Нет программы на выбранный день</p>
-                <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#64748b' }}>Используйте ◄ ► для выбора другого дня</p>
+                <p style={{ margin: 0, fontWeight: 'bold' }}>
+                  {epgList.length > 0 ? 'Нет программы на выбранный день' : 'Программа передач для этого канала отсутствует'}
+                </p>
+                <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#64748b' }}>
+                  {epgList.length > 0 ? 'Используйте ◄ ► для выбора дня с записями архива' : 'Прямой эфир доступен для просмотра'}
+                </p>
               </div>
             ) : (
               filteredEpg.map((prog, idx) => {
