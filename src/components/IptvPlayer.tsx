@@ -119,25 +119,35 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     return () => clearTimeout(timer);
   }, [toastMessage]);
 
-  // Format helpers with optional custom timezone offset
-  const getTimeWithOffset = useCallback((ms: number) => {
-    if (settings.timeZoneOffset === undefined || settings.timeZoneOffset === 'auto') {
-      return new Date(ms);
-    }
-    const offsetHours = typeof settings.timeZoneOffset === 'number' ? settings.timeZoneOffset : 3;
-    const localOffsetMs = new Date(ms).getTimezoneOffset() * 60000;
-    return new Date(ms + (offsetHours * 3600000) + localOffsetMs);
-  }, [settings.timeZoneOffset]);
-
+  // Format helpers with Moscow Timezone (Europe/Moscow, UTC+3) as standard for Russian IPTV/EPG
   const formatTime = useCallback((ms: number) => {
-    const d = getTimeWithOffset(ms);
-    return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-  }, [getTimeWithOffset]);
+    if (!ms) return '--:--';
+    try {
+      return new Date(ms).toLocaleTimeString('ru-RU', {
+        timeZone: 'Europe/Moscow',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch {
+      const d = new Date(ms + 3 * 3600000 + new Date(ms).getTimezoneOffset() * 60000);
+      return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    }
+  }, []);
 
   const formatSecondsToClock = useCallback((ms: number) => {
-    const d = getTimeWithOffset(ms);
-    return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  }, [getTimeWithOffset]);
+    if (!ms) return '--:--:--';
+    try {
+      return new Date(ms).toLocaleTimeString('ru-RU', {
+        timeZone: 'Europe/Moscow',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+    } catch {
+      const d = new Date(ms + 3 * 3600000 + new Date(ms).getTimezoneOffset() * 60000);
+      return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+  }, []);
 
   // Filter groups
   const groups = useMemo(() => {
@@ -169,16 +179,19 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }));
   }, [filteredChannels, channelStartIndex, channelEndIndex]);
 
-  // Filter EPG by selected day (0 = today, -1 = yesterday, etc.)
+  // Filter EPG by selected day (0 = today, -1 = yesterday, +1 = tomorrow, etc.) in Moscow Time
   const filteredEpg = useMemo(() => {
-    const targetDate = new Date();
-    targetDate.setDate(targetDate.getDate() + selectedDayOffset);
-    targetDate.setHours(0, 0, 0, 0);
-    const dayStart = targetDate.getTime();
-    const dayEnd = dayStart + 24 * 60 * 60 * 1000;
+    const tzOffsetMs = 3 * 3600 * 1000;
+    const nowInMsk = new Date(Date.now() + tzOffsetMs);
+    const targetInMsk = new Date(nowInMsk);
+    targetInMsk.setUTCDate(targetInMsk.getUTCDate() + selectedDayOffset);
+    targetInMsk.setUTCHours(0, 0, 0, 0);
+
+    const dayStartUtc = targetInMsk.getTime() - tzOffsetMs;
+    const dayEndUtc = dayStartUtc + 24 * 3600 * 1000;
 
     // Show any program that overlaps with this day
-    return epgList.filter(p => p.end > dayStart && p.start < dayEnd);
+    return epgList.filter(p => p.end > dayStartUtc && p.start < dayEndUtc);
   }, [epgList, selectedDayOffset]);
 
   // Load settings on mount
@@ -243,63 +256,78 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
     loadChannels(settings.playlistUrl);
   }, [loadChannels, settings.playlistUrl]);
 
-  // Whenever selectedChannel changes, fetch REAL EPG from backend (with sample EPG fallback)
+  // Whenever selectedChannel changes, fetch REAL EPG from backend
   useEffect(() => {
     if (!selectedChannel) return;
     let isCancelled = false;
+    let retryTimer: NodeJS.Timeout | null = null;
     setIsLoadingEpg(true);
 
     const tvgId = selectedChannel.tvgId || '';
     const name = selectedChannel.name || '';
 
-    fetch(`/api/iptv/epg?channelId=${encodeURIComponent(tvgId)}&name=${encodeURIComponent(name)}`)
-      .then(res => (res.ok ? res.json() : []))
-      .then((realPrograms: EpgProgram[]) => {
-        if (isCancelled) return;
-        const now = Date.now();
+    const fetchEpg = (attempt = 1) => {
+      fetch(`/api/iptv/epg?channelId=${encodeURIComponent(tvgId)}&name=${encodeURIComponent(name)}`)
+        .then(res => (res.ok ? res.json() : []))
+        .then((realPrograms: EpgProgram[]) => {
+          if (isCancelled) return;
+          const now = Date.now();
 
-        if (Array.isArray(realPrograms) && realPrograms.length > 0) {
-          // Re-evaluate isLive and hasArchive with current client timestamp
-          const programs = realPrograms.map(p => ({
-            ...p,
-            isLive: now >= p.start && now < p.end,
-            hasArchive: p.end <= now
-          }));
-          setEpgList(programs);
+          if (Array.isArray(realPrograms) && realPrograms.length > 0) {
+            // Re-evaluate isLive and hasArchive with current client timestamp
+            const programs = realPrograms.map(p => ({
+              ...p,
+              isLive: now >= p.start && now < p.end,
+              hasArchive: p.end <= now
+            }));
+            setEpgList(programs);
 
-          const liveProg = programs.find(p => p.isLive) || programs.find(p => p.end <= now) || programs[0];
-          setCurrentPlayingProgram(liveProg);
-          setActiveTimelineProgram(liveProg);
-          setSeekTimestamp(now);
-          setIsArchiveMode(false);
-        } else {
-          // Fallback to sample generated schedule
-          const generated = generateSample7DayEpg(selectedChannel);
-          setEpgList(generated);
+            const liveProg = programs.find(p => p.isLive) || programs.find(p => p.end <= now) || programs[0];
+            setCurrentPlayingProgram(liveProg);
+            setActiveTimelineProgram(liveProg);
+            setSeekTimestamp(now);
+            setIsArchiveMode(false);
+            setIsLoadingEpg(false);
+          } else {
+            // If empty on boot, server might still be syncing EPG cache; retry up to 3 times
+            if (attempt <= 3) {
+              retryTimer = setTimeout(() => {
+                if (!isCancelled) fetchEpg(attempt + 1);
+              }, 3000);
+            } else {
+              setEpgList([]);
+              // Default clean live program info without fake schedules
+              const fallbackLive: EpgProgram = {
+                id: `live-${selectedChannel.id}`,
+                channelId: selectedChannel.id,
+                title: selectedChannel.name,
+                description: 'Прямой эфир телеканала',
+                category: selectedChannel.group || 'ТВ',
+                start: now - 3600000,
+                end: now + 3600000,
+                isLive: true,
+                hasArchive: false
+              };
+              setCurrentPlayingProgram(fallbackLive);
+              setActiveTimelineProgram(fallbackLive);
+              setSeekTimestamp(now);
+              setIsArchiveMode(false);
+              setIsLoadingEpg(false);
+            }
+          }
+        })
+        .catch(() => {
+          if (isCancelled) return;
+          setEpgList([]);
+          setIsLoadingEpg(false);
+        });
+    };
 
-          const nowProg = generated.find(p => p.isLive) || generated[0];
-          setCurrentPlayingProgram(nowProg);
-          setActiveTimelineProgram(nowProg);
-          setSeekTimestamp(now);
-          setIsArchiveMode(false);
-        }
-      })
-      .catch(() => {
-        if (isCancelled) return;
-        const generated = generateSample7DayEpg(selectedChannel);
-        setEpgList(generated);
-        const nowProg = generated.find(p => p.isLive) || generated[0];
-        setCurrentPlayingProgram(nowProg);
-        setActiveTimelineProgram(nowProg);
-        setSeekTimestamp(Date.now());
-        setIsArchiveMode(false);
-      })
-      .finally(() => {
-        if (!isCancelled) setIsLoadingEpg(false);
-      });
+    fetchEpg(1);
 
     return () => {
       isCancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
     };
   }, [selectedChannel]);
 
@@ -733,7 +761,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
             break;
 
           case 'RIGHT':
-            setSelectedDayOffset(prev => Math.min(0, prev + 1));
+            setSelectedDayOffset(prev => Math.min(1, prev + 1));
             setFocusedProgramIndex(0);
             break;
 
@@ -1213,6 +1241,7 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
 
                     <div
                       style={{
+                        position: 'relative',
                         width: '38px',
                         height: '38px',
                         borderRadius: '8px',
@@ -1225,18 +1254,17 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
                         flexShrink: 0
                       }}
                     >
+                      <Tv style={{ position: 'absolute', width: '20px', height: '20px', color: '#475569' }} />
                       {channel.logo ? (
                         <img
                           src={channel.logo}
                           alt={channel.name}
-                          style={{ width: '100%', height: '100%', objectFit: 'contain', padding: '2px' }}
+                          style={{ position: 'relative', width: '100%', height: '100%', objectFit: 'contain', padding: '2px', zIndex: 1 }}
                           onError={(e) => {
-                            (e.target as HTMLElement).style.display = 'none';
+                            e.currentTarget.style.display = 'none';
                           }}
                         />
-                      ) : (
-                        <Tv style={{ width: '20px', height: '20px', color: '#94a3b8' }} />
-                      )}
+                      ) : null}
                     </div>
 
                     <div style={{ flex: 1, minWidth: 0 }}>
@@ -1359,15 +1387,21 @@ https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`;
               borderBottom: '1px solid rgba(51, 65, 85, 0.5)'
             }}
           >
-            {[-7, -6, -5, -4, -3, -2, -1, 0].map((offset) => {
+            {[-7, -6, -5, -4, -3, -2, -1, 0, 1].map((offset) => {
+              const d = new Date();
+              d.setDate(d.getDate() + offset);
+              const dayStr = d.toLocaleDateString('ru-RU', { weekday: 'short', day: 'numeric', month: 'short' });
+
               const label =
-                offset === 0
+                offset === 1
+                  ? 'Завтра'
+                  : offset === 0
                   ? 'Сегодня'
                   : offset === -1
                   ? 'Вчера'
                   : offset === -2
                   ? 'Позавчера'
-                  : `${offset}д`;
+                  : dayStr;
               const isSelected = selectedDayOffset === offset;
 
               return (

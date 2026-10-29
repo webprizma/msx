@@ -14,6 +14,16 @@ const programsByChannel = new Map<string, EpgProgram[]>();
 const channelAliases = new Map<string, string>(); // name.toLowerCase() -> tvgId
 let isSyncing = false;
 let lastSyncTime = 0;
+let totalProgrammesCount = 0;
+
+export function getEpgSyncStatus() {
+  return {
+    isSyncing,
+    channelsCount: programsByChannel.size,
+    totalProgrammes: totalProgrammesCount,
+    lastSyncTime
+  };
+}
 
 function parseXmltvDate(str: string): number {
   if (!str) return 0;
@@ -51,12 +61,15 @@ export function initEpgCache() {
       const raw = fs.readFileSync(CACHE_FILE, 'utf8');
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {
+        let count = 0;
         for (const [k, v] of Object.entries(parsed)) {
           if (Array.isArray(v)) {
             programsByChannel.set(k, v);
+            count += v.length;
           }
         }
-        console.log(`[EPG Service] Loaded cached EPG for ${programsByChannel.size} channels from disk.`);
+        totalProgrammesCount = count;
+        console.log(`[EPG Service] Loaded cached EPG for ${programsByChannel.size} channels (${count} programs) from disk.`);
       }
     }
   } catch (e) {
@@ -178,17 +191,20 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
     }
 
     lastSyncTime = Date.now();
+    totalProgrammesCount = totalProgrammes;
     console.log(`[EPG Service] Successfully indexed ${totalProgrammes} real programmes for ${tempMap.size} channels!`);
 
-    // Persist small snapshot to disk
+    // Persist snapshot to disk asynchronously without blocking event loop
     try {
       const diskObj: Record<string, EpgProgram[]> = {};
       for (const [k, v] of programsByChannel.entries()) {
         diskObj[k] = v;
       }
-      fs.writeFileSync(CACHE_FILE, JSON.stringify(diskObj), 'utf8');
+      fs.promises.writeFile(CACHE_FILE, JSON.stringify(diskObj), 'utf8').catch(saveErr => {
+        console.warn('[EPG Service] Could not write cache to disk:', saveErr);
+      });
     } catch (saveErr) {
-      console.error('[EPG Service] Could not write cache to disk:', saveErr);
+      console.warn('[EPG Service] Could not prepare cache for disk:', saveErr);
     }
 
     return {
@@ -206,9 +222,15 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
 
 // Get programs for a given channel by tvgId, tvgName, or channelName
 export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[] {
-  // 1. Direct match by tvgId
-  if (tvgId && programsByChannel.has(tvgId)) {
-    return programsByChannel.get(tvgId)!;
+  // 1. Direct match by tvgId (exact and lowercase)
+  if (tvgId) {
+    if (programsByChannel.has(tvgId)) {
+      return programsByChannel.get(tvgId)!;
+    }
+    const lowerId = tvgId.toLowerCase();
+    if (programsByChannel.has(lowerId)) {
+      return programsByChannel.get(lowerId)!;
+    }
   }
 
   // 2. Direct match by channelName
@@ -222,6 +244,15 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
     const mappedId = channelAliases.get(norm);
     if (mappedId && programsByChannel.has(mappedId)) {
       return programsByChannel.get(mappedId)!;
+    }
+
+    // Strip common suffixes (HD, FHD, Double, +2, +4) for fallback
+    const stripped = norm.replace(/(hd|fhd|double|\+2|\+4|\+6)$/, '');
+    if (stripped && stripped !== norm) {
+      const fallbackId = channelAliases.get(stripped);
+      if (fallbackId && programsByChannel.has(fallbackId)) {
+        return programsByChannel.get(fallbackId)!;
+      }
     }
 
     // Substring search in channel aliases

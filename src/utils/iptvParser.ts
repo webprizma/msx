@@ -1,5 +1,15 @@
 import { Channel, EpgProgram } from '../types/iptv';
 
+function cleanCategory(raw: string): string {
+  if (!raw) return 'Общие';
+  let clean = raw.replace(/^\d+\.\s*/, '').trim();
+  if (clean.includes('/')) {
+    const parts = clean.split('/');
+    clean = parts[1]?.trim() || parts[0]?.trim();
+  }
+  return clean || 'Общие';
+}
+
 export function parseM3uPlaylist(content: string, defaultCatchupDays = 7): Channel[] {
   const lines = content.split('\n');
   const channels: Channel[] = [];
@@ -19,6 +29,7 @@ export function parseM3uPlaylist(content: string, defaultCatchupDays = 7): Chann
       const catchupMatch = line.match(/catchup="([^"]*)"/i);
       const catchupDaysMatch = line.match(/catchup-days="([^"]*)"/i);
       const catchupSourceMatch = line.match(/catchup-source="([^"]*)"/i);
+      const tvgRecMatch = line.match(/tvg-rec="([^"]*)"/i);
 
       // Extract channel title after last comma
       const lastCommaIdx = line.lastIndexOf(',');
@@ -28,14 +39,14 @@ export function parseM3uPlaylist(content: string, defaultCatchupDays = 7): Chann
       currentChannel.name = title || tvgNameMatch?.[1] || 'Канал';
       currentChannel.logo = tvgLogoMatch?.[1] || '';
       const rawGrp = groupMatch?.[1];
-      currentChannel.group = rawGrp ? rawGrp.replace(/^\d+\.\s*/, '') : 'Общие';
+      currentChannel.group = cleanCategory(rawGrp || 'Общие');
       currentChannel.tvgId = tvgIdMatch?.[1] || tvgNameMatch?.[1] || title;
-      currentChannel.catchupDays = catchupDaysMatch ? parseInt(catchupDaysMatch[1], 10) : defaultCatchupDays;
-      currentChannel.catchupSource = catchupSourceMatch?.[1];
+      currentChannel.catchupDays = catchupDaysMatch ? parseInt(catchupDaysMatch[1], 10) : (tvgRecMatch ? parseInt(tvgRecMatch[1], 10) : defaultCatchupDays);
+      currentChannel.catchupSource = catchupSourceMatch?.[1] || '?utc={utc}&lutc={lutc}';
       currentChannel.catchupType = catchupMatch?.[1] || 'shift';
     } else if (line.startsWith('#EXTGRP:') && currentChannel) {
       const raw = line.substring(8).trim();
-      currentChannel.group = raw.replace(/^\d+\.\s*/, '') || raw;
+      currentChannel.group = cleanCategory(raw);
     } else if (line.length > 0 && !line.startsWith('#') && currentChannel) {
       currentChannel.streamUrl = line;
       if (currentChannel.name && currentChannel.streamUrl) {

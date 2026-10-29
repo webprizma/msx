@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { initEpgCache, syncEpg, getChannelEpg } from './src/utils/epgService.ts';
+import { initEpgCache, syncEpg, getChannelEpg, getEpgSyncStatus } from './src/utils/epgService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -346,6 +346,16 @@ app.post('/api/iptv/settings', async (req, res) => {
   }
 });
 
+function cleanCategory(raw: string): string {
+  if (!raw) return 'Общие';
+  let clean = raw.replace(/^\d+\.\s*/, '').trim();
+  if (clean.includes('/')) {
+    const parts = clean.split('/');
+    clean = parts[1]?.trim() || parts[0]?.trim();
+  }
+  return clean || 'Общие';
+}
+
 // Real EPG endpoint for TV channels
 app.get('/api/iptv/epg', (req, res) => {
   const channelId = (req.query.channelId as string) || (req.query.tvgId as string) || '';
@@ -354,9 +364,14 @@ app.get('/api/iptv/epg', (req, res) => {
   res.json(programs);
 });
 
+// EPG sync status endpoint
+app.get('/api/iptv/epg/status', (req, res) => {
+  res.json(getEpgSyncStatus());
+});
+
 // Trigger manual EPG sync
 app.post('/api/iptv/epg/sync', async (req, res) => {
-  const targetEpgUrl = req.body?.epgUrl || iptvSettings.epgUrl || 'https://rus.epg.team/1.1.xml';
+  const targetEpgUrl = req.body?.epgUrl || iptvSettings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442';
   try {
     const result = await syncEpg(targetEpgUrl);
     res.json(result);
@@ -396,18 +411,22 @@ app.get('/api/iptv/channels', async (req, res) => {
             const groupMatch = line.match(/group-title="([^"]*)"/i);
             const catchupDaysMatch = line.match(/catchup-days="([^"]*)"/i);
             const catchupSourceMatch = line.match(/catchup-source="([^"]*)"/i);
+            const tvgRecMatch = line.match(/tvg-rec="([^"]*)"/i);
             const lastComma = line.lastIndexOf(',');
+
             curr.name = lastComma !== -1 ? line.substring(lastComma + 1).trim() : 'Канал';
             curr.id = `ch-${channels.length + 1}`;
             curr.tvgId = tvgIdMatch?.[1] || '';
             curr.tvgName = tvgNameMatch?.[1] || '';
+            curr.logo = tvgLogoMatch?.[1] || '';
             const rawGroup = groupMatch?.[1];
-            curr.group = rawGroup ? rawGroup.replace(/^\d+\.\s*/, '') : 'Общие';
-            curr.catchupDays = catchupDaysMatch ? parseInt(catchupDaysMatch[1], 10) : 7;
-            curr.catchupSource = catchupSourceMatch?.[1];
+            curr.group = cleanCategory(rawGroup || 'Общие');
+            curr.catchupDays = catchupDaysMatch ? parseInt(catchupDaysMatch[1], 10) : (tvgRecMatch ? parseInt(tvgRecMatch[1], 10) : 7);
+            curr.catchupSource = catchupSourceMatch?.[1] || '?utc={utc}&lutc={lutc}';
+            curr.catchupType = 'shift';
           } else if (line.startsWith('#EXTGRP:') && curr) {
             const rawGrp = line.substring(8).trim();
-            curr.group = rawGrp.replace(/^\d+\.\s*/, '') || rawGrp;
+            curr.group = cleanCategory(rawGrp);
           } else if (line.length > 0 && !line.startsWith('#') && curr) {
             curr.streamUrl = line;
             if (curr.name && curr.streamUrl) {
