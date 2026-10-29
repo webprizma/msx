@@ -54,6 +54,78 @@ function normalizeName(name: string): string {
 // Compact program array format: [start, end, title, category, description]
 type CompactProgram = [number, number, string, string, string];
 
+/**
+ * Deduplicate programs: if multiple entries exist for the same time slot or overlapping same movie,
+ * merge them into a single clean entry, prioritizing the one WITH description and without trailing dots.
+ */
+export function deduplicateEpg(programs: EpgProgram[]): EpgProgram[] {
+  if (!programs || programs.length <= 1) return programs || [];
+
+  // Sort primarily by start time ascending, then by description length descending (richer description first)
+  const sorted = [...programs].sort((a, b) => {
+    if (a.start !== b.start) return a.start - b.start;
+    const aDescLen = (a.description || '').trim().length;
+    const bDescLen = (b.description || '').trim().length;
+    return bDescLen - aDescLen;
+  });
+
+  const result: EpgProgram[] = [];
+
+  for (const prog of sorted) {
+    const cleanTitle = (prog.title || 'Передача').trim().replace(/\.+$/, '');
+    const cleanProg: EpgProgram = {
+      ...prog,
+      title: cleanTitle
+    };
+
+    if (result.length === 0) {
+      result.push(cleanProg);
+      continue;
+    }
+
+    const prev = result[result.length - 1];
+
+    // Check duplicate conditions
+    const sameStart = Math.abs(cleanProg.start - prev.start) < 90000; // within 1.5 minutes
+    const sameEnd = Math.abs(cleanProg.end - prev.end) < 90000;
+    const prevNormTitle = normalizeName(prev.title);
+    const progNormTitle = normalizeName(cleanProg.title);
+    const sameTitle =
+      prevNormTitle === progNormTitle ||
+      (prevNormTitle.length > 5 && progNormTitle.includes(prevNormTitle)) ||
+      (progNormTitle.length > 5 && prevNormTitle.includes(progNormTitle));
+
+    const isDuplicate = sameStart || (sameEnd && sameTitle) || (sameTitle && cleanProg.start < prev.end);
+
+    if (isDuplicate) {
+      const prevDesc = (prev.description || '').trim();
+      const progDesc = (cleanProg.description || '').trim();
+
+      // If new entry has richer description, prefer its description and title
+      if (progDesc.length > prevDesc.length) {
+        prev.description = cleanProg.description;
+        prev.title = cleanProg.title;
+      }
+
+      // Upgrade category if current is generic 'ТВ'
+      if ((!prev.category || prev.category === 'ТВ') && cleanProg.category && cleanProg.category !== 'ТВ') {
+        prev.category = cleanProg.category;
+      }
+
+      // Span full duration
+      prev.start = Math.min(prev.start, cleanProg.start);
+      prev.end = Math.max(prev.end, cleanProg.end);
+      const now = Date.now();
+      prev.isLive = now >= prev.start && now < prev.end;
+      prev.hasArchive = prev.end <= now;
+    } else {
+      result.push(cleanProg);
+    }
+  }
+
+  return result;
+}
+
 // Initialize cache from disk (fast gzipped snapshot, ~4MB instead of 230MB)
 export function initEpgCache() {
   try {
@@ -90,8 +162,9 @@ export function initEpgCache() {
                 isLive: now >= start && now < end,
                 hasArchive: end <= now
               }));
-              programsByChannel.set(chId, restored);
-              count += restored.length;
+              const deduped = deduplicateEpg(restored);
+              programsByChannel.set(chId, deduped);
+              count += deduped.length;
             }
           }
         }
@@ -219,10 +292,10 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
       }
     }
 
-    // Sort programmes by start time for all channels
+    // Sort programmes by start time and deduplicate for all channels
     for (const [chId, list] of tempMap.entries()) {
-      list.sort((a, b) => a.start - b.start);
-      programsByChannel.set(chId, list);
+      const deduped = deduplicateEpg(list);
+      programsByChannel.set(chId, deduped);
     }
 
     lastSyncTime = Date.now();
@@ -262,16 +335,22 @@ export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg
   }
 }
 
+// Helper to return deduplicated program list
+function resolveAndDedupe(list?: EpgProgram[]): EpgProgram[] {
+  if (!list || list.length === 0) return [];
+  return deduplicateEpg(list);
+}
+
 // Ultra-smart channel lookup supporting tvgId (ch001, ch1, 1), name, aliases, stripped suffixes
 export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[] {
   // 1. Direct match by tvgId
   if (tvgId) {
     if (programsByChannel.has(tvgId)) {
-      return programsByChannel.get(tvgId)!;
+      return resolveAndDedupe(programsByChannel.get(tvgId));
     }
     const lowerId = tvgId.toLowerCase();
     if (programsByChannel.has(lowerId)) {
-      return programsByChannel.get(lowerId)!;
+      return resolveAndDedupe(programsByChannel.get(lowerId));
     }
 
     // Numeric variations: ch001, ch01, ch1
@@ -281,15 +360,15 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
       const padded3 = `ch${String(num).padStart(3, '0')}`;
       const padded2 = `ch${String(num).padStart(2, '0')}`;
       const unpadded = `ch${num}`;
-      if (programsByChannel.has(padded3)) return programsByChannel.get(padded3)!;
-      if (programsByChannel.has(padded2)) return programsByChannel.get(padded2)!;
-      if (programsByChannel.has(unpadded)) return programsByChannel.get(unpadded)!;
+      if (programsByChannel.has(padded3)) return resolveAndDedupe(programsByChannel.get(padded3));
+      if (programsByChannel.has(padded2)) return resolveAndDedupe(programsByChannel.get(padded2));
+      if (programsByChannel.has(unpadded)) return resolveAndDedupe(programsByChannel.get(unpadded));
     }
   }
 
   // 2. Direct match by channelName
   if (channelName && programsByChannel.has(channelName)) {
-    return programsByChannel.get(channelName)!;
+    return resolveAndDedupe(programsByChannel.get(channelName));
   }
 
   // 3. Match by normalized name alias
@@ -297,7 +376,7 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
     const norm = normalizeName(channelName);
     const mappedId = channelAliases.get(norm);
     if (mappedId && programsByChannel.has(mappedId)) {
-      return programsByChannel.get(mappedId)!;
+      return resolveAndDedupe(programsByChannel.get(mappedId));
     }
 
     // Strip common suffixes (HD, FHD, Double, +2, +4, +6) for fallback
@@ -305,7 +384,7 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
     if (stripped && stripped !== norm) {
       const fallbackId = channelAliases.get(stripped);
       if (fallbackId && programsByChannel.has(fallbackId)) {
-        return programsByChannel.get(fallbackId)!;
+        return resolveAndDedupe(programsByChannel.get(fallbackId));
       }
     }
 
@@ -313,7 +392,7 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
     for (const [aliasNorm, id] of channelAliases.entries()) {
       if (aliasNorm === norm || (norm.length > 4 && aliasNorm.includes(norm)) || (aliasNorm.length > 4 && norm.includes(aliasNorm))) {
         if (programsByChannel.has(id)) {
-          return programsByChannel.get(id)!;
+          return resolveAndDedupe(programsByChannel.get(id));
         }
       }
     }

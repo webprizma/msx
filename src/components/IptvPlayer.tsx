@@ -30,6 +30,61 @@ interface IptvPlayerProps {
 
 type OverlayMode = 'none' | 'channels' | 'epg' | 'prompt' | 'timeline' | 'settings';
 
+// Helper: deduplicate programs, keeping the version with the richer description
+function deduplicateClientEpg(programs: EpgProgram[]): EpgProgram[] {
+  if (!programs || programs.length <= 1) return programs || [];
+
+  const sorted = [...programs].sort((a, b) => {
+    if (a.start !== b.start) return a.start - b.start;
+    const aDescLen = (a.description || '').trim().length;
+    const bDescLen = (b.description || '').trim().length;
+    return bDescLen - aDescLen;
+  });
+
+  const result: EpgProgram[] = [];
+
+  for (const prog of sorted) {
+    const cleanTitle = (prog.title || 'Передача').trim().replace(/\.+$/, '');
+    const cleanProg: EpgProgram = { ...prog, title: cleanTitle };
+
+    if (result.length === 0) {
+      result.push(cleanProg);
+      continue;
+    }
+
+    const prev = result[result.length - 1];
+    const sameStart = Math.abs(cleanProg.start - prev.start) < 90000;
+    const sameEnd = Math.abs(cleanProg.end - prev.end) < 90000;
+    const prevNorm = prev.title.toLowerCase().replace(/[\s\-_!?:.,/\\()[\]]+/g, '');
+    const progNorm = cleanProg.title.toLowerCase().replace(/[\s\-_!?:.,/\\()[\]]+/g, '');
+    const sameTitle =
+      prevNorm === progNorm ||
+      (prevNorm.length > 5 && progNorm.includes(prevNorm)) ||
+      (progNorm.length > 5 && prevNorm.includes(progNorm));
+
+    const isDuplicate = sameStart || (sameEnd && sameTitle) || (sameTitle && cleanProg.start < prev.end);
+
+    if (isDuplicate) {
+      const prevDesc = (prev.description || '').trim();
+      const progDesc = (cleanProg.description || '').trim();
+
+      if (progDesc.length > prevDesc.length) {
+        prev.description = cleanProg.description;
+        prev.title = cleanProg.title;
+      }
+      if ((!prev.category || prev.category === 'ТВ') && cleanProg.category && cleanProg.category !== 'ТВ') {
+        prev.category = cleanProg.category;
+      }
+      prev.start = Math.min(prev.start, cleanProg.start);
+      prev.end = Math.max(prev.end, cleanProg.end);
+    } else {
+      result.push(cleanProg);
+    }
+  }
+
+  return result;
+}
+
 export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   isTvMode = false,
   onEnterTvMode,
@@ -208,8 +263,9 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     const dayStartUtc = targetInMsk.getTime() - tzOffsetMs;
     const dayEndUtc = dayStartUtc + 24 * 3600 * 1000;
 
-    // Show any program that overlaps with this day
-    return epgList.filter(p => p.end > dayStartUtc && p.start < dayEndUtc);
+    // Show any program that overlaps with this day, deduplicated with descriptions prioritized
+    const dayPrograms = epgList.filter(p => p.end > dayStartUtc && p.start < dayEndUtc);
+    return deduplicateClientEpg(dayPrograms);
   }, [epgList, selectedDayOffset]);
 
   // Load settings on mount
@@ -342,7 +398,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       const cached = epgCache.current.get(selectedChannel.id)!;
       const now = Date.now();
       if (cached.length > 0) {
-        const programs = cached.map(p => ({
+        const cleanCached = deduplicateClientEpg(cached);
+        const programs = cleanCached.map(p => ({
           ...p,
           isLive: now >= p.start && now < p.end,
           hasArchive: p.end <= now
@@ -374,8 +431,9 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           const now = Date.now();
 
           if (Array.isArray(realPrograms) && realPrograms.length > 0) {
-            epgCache.current.set(selectedChannel.id, realPrograms);
-            const programs = realPrograms.map(p => ({
+            const cleanPrograms = deduplicateClientEpg(realPrograms);
+            epgCache.current.set(selectedChannel.id, cleanPrograms);
+            const programs = cleanPrograms.map(p => ({
               ...p,
               isLive: now >= p.start && now < p.end,
               hasArchive: p.end <= now
