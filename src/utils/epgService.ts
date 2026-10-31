@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
+import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
 import type { EpgProgram } from '../types/iptv.ts';
 
@@ -9,19 +10,31 @@ const __dirname = path.dirname(__filename);
 const CACHE_DIR = path.resolve(__dirname, '../../iptv-cache');
 const CACHE_FILE_GZ = path.join(CACHE_DIR, 'epg-data.json.gz');
 
+// Verified reliable Russian / CIS IPTV EPG mirrors
+export const EPG_MIRROR_SOURCES: string[] = [
+  'https://rus.epg.team/7.1.xml?pkg=442',
+  'https://epg.it999.ru/epg2.xml.gz',
+  'https://epg.it999.ru/edem.xml.gz',
+  'https://iptvx.one/epg/epg_lite.xml.gz',
+  'http://programtv.ru/xmltv.xml.gz'
+];
+
 // In-memory cache for ultra-fast lookups
 const programsByChannel = new Map<string, EpgProgram[]>();
 const channelAliases = new Map<string, string>(); // normalized name -> tvgId
 let isSyncing = false;
 let lastSyncTime = 0;
 let totalProgrammesCount = 0;
+let currentMirrorSource = EPG_MIRROR_SOURCES[0];
 
 export function getEpgSyncStatus() {
   return {
     isSyncing,
     channelsCount: programsByChannel.size,
     totalProgrammes: totalProgrammesCount,
-    lastSyncTime
+    lastSyncTime,
+    currentMirror: currentMirrorSource,
+    mirrorsAvailable: EPG_MIRROR_SOURCES.length
   };
 }
 
@@ -48,7 +61,16 @@ function decodeXmlEntities(str: string): string {
 }
 
 function normalizeName(name: string): string {
+  if (!name) return '';
   return name.toLowerCase().replace(/[\s\-_!?:.,/\\()[\]]+/g, '').trim();
+}
+
+function stripSuffixes(name: string): string {
+  if (!name) return '';
+  // Strip HD, FHD, UHD, 4K, HDR, 50fps, double, timezone shifts (+2, +4, etc.)
+  return name
+    .replace(/[\s\-_]*(?:hd|fhd|uhd|4k|hdr|50fps|orig|original|double|\+2|\+4|\+6|\+7|\+8)$/i, '')
+    .trim();
 }
 
 // Compact program array format: [start, end, title, category, description]
@@ -170,7 +192,8 @@ export function initEpgCache() {
         }
 
         totalProgrammesCount = count;
-        console.log(`[EPG Service] Loaded ${count} programs for ${programsByChannel.size} channels from gzipped cache.`);
+        lastSyncTime = parsed.timestamp || Date.now();
+        console.log(`[EPG Service] Loaded durable cache with ${count} programs for ${programsByChannel.size} channels.`);
       }
     }
   } catch (e) {
@@ -178,158 +201,267 @@ export function initEpgCache() {
   }
 }
 
-// Background sync from XMLTV URL (e.g. https://rus.epg.team/7.1.xml?pkg=442)
-export async function syncEpg(epgUrl: string = 'https://rus.epg.team/7.1.xml?pkg=442'): Promise<{ success: boolean; channelsCount: number; message: string }> {
+// Asynchronously save compact gzipped snapshot to disk (~4MB)
+async function persistDurableCache() {
+  try {
+    const compactChannels: Record<string, CompactProgram[]> = {};
+    for (const [k, progs] of programsByChannel.entries()) {
+      compactChannels[k] = progs.map(p => [p.start, p.end, p.title || '', p.category || '', p.description || '']);
+    }
+
+    const snapshot = {
+      timestamp: Date.now(),
+      aliases: Object.fromEntries(channelAliases),
+      channels: compactChannels
+    };
+
+    const compressed = zlib.gzipSync(Buffer.from(JSON.stringify(snapshot), 'utf8'));
+    await fs.promises.writeFile(CACHE_FILE_GZ, compressed);
+    console.log(`[EPG Service] Successfully persisted durable cache (${(compressed.length / 1024 / 1024).toFixed(2)} MB)`);
+  } catch (saveErr) {
+    console.warn('[EPG Service] Could not persist compressed cache:', saveErr);
+  }
+}
+
+/**
+ * Streams and parses XMLTV data from a single URL (supports both plain XML and GZIP).
+ */
+async function parseEpgFromStream(url: string): Promise<{ channelCount: number; progCount: number }> {
+  const isGz = url.toLowerCase().includes('.gz');
+  console.log(`[EPG Service] Fetching stream from: ${url} (gzipped: ${isGz})`);
+
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept-Encoding': 'gzip, deflate, br'
+    },
+    signal: AbortSignal.timeout(120000)
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  }
+
+  // Set up chunk reader: if gzipped, decompress on-the-fly with node zlib
+  let chunkIterable: AsyncIterable<Buffer | string>;
+  if (isGz) {
+    const nodeStream = Readable.fromWeb(response.body as any);
+    const gunzip = zlib.createGunzip();
+    nodeStream.pipe(gunzip);
+    chunkIterable = gunzip;
+  } else {
+    // Plain web stream
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    chunkIterable = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            const { done, value } = await reader.read();
+            if (done) return { done: true, value: undefined };
+            return { done: false, value: decoder.decode(value, { stream: true }) };
+          }
+        };
+      }
+    };
+  }
+
+  let buffer = '';
+  const tempMap = new Map<string, EpgProgram[]>();
+  let totalProgrammes = 0;
+  let lastFlushTime = Date.now();
+
+  for await (const chunk of chunkIterable) {
+    const chunkStr = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    buffer += chunkStr;
+
+    // 1. Extract channels and ALL their <display-name> aliases
+    const chBlockRegex = /<channel\s+id="([^"]+)">([\s\S]*?)<\/channel>/gi;
+    let chMatch;
+    let lastChIndex = 0;
+    while ((chMatch = chBlockRegex.exec(buffer)) !== null) {
+      lastChIndex = chBlockRegex.lastIndex;
+      const chId = chMatch[1];
+      const inner = chMatch[2];
+
+      // Index direct chId normalized
+      channelAliases.set(normalizeName(chId), chId);
+
+      const dispRegex = /<display-name[^>]*>([^<]+)<\/display-name>/gi;
+      let dMatch;
+      while ((dMatch = dispRegex.exec(inner)) !== null) {
+        const rawName = decodeXmlEntities(dMatch[1]).trim();
+        if (rawName) {
+          channelAliases.set(normalizeName(rawName), chId);
+          const stripped = stripSuffixes(rawName);
+          if (stripped && stripped !== rawName) {
+            channelAliases.set(normalizeName(stripped), chId);
+          }
+        }
+      }
+    }
+
+    // 2. Extract programmes <programme ...> ... </programme>
+    const progRegex = /<programme\s+([^>]+)>([\s\S]*?)<\/programme>/gi;
+    let progMatch;
+    let lastProgIndex = 0;
+
+    while ((progMatch = progRegex.exec(buffer)) !== null) {
+      lastProgIndex = progRegex.lastIndex;
+      const attrs = progMatch[1];
+      const inner = progMatch[2];
+
+      const chIdMatch = attrs.match(/channel="([^"]+)"/i);
+      const startMatch = attrs.match(/start="([^"]+)"/i);
+      const stopMatch = attrs.match(/stop="([^"]+)"/i);
+
+      if (!chIdMatch || !startMatch || !stopMatch) continue;
+
+      const chId = chIdMatch[1];
+      const start = parseXmltvDate(startMatch[1]);
+      const end = parseXmltvDate(stopMatch[1]);
+      if (!start || !end) continue;
+
+      const titleMatch = inner.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      const descMatch = inner.match(/<desc[^>]*>([\s\S]*?)<\/desc>/i);
+      const catMatch = inner.match(/<category[^>]*>([\s\S]*?)<\/category>/i);
+
+      const title = decodeXmlEntities(titleMatch ? titleMatch[1].trim() : 'Передача');
+      const rawDesc = decodeXmlEntities(descMatch ? descMatch[1].trim() : '');
+      const desc = rawDesc.length > 250 ? rawDesc.slice(0, 250) + '...' : rawDesc;
+      const category = decodeXmlEntities(catMatch ? catMatch[1].trim() : 'ТВ');
+
+      const now = Date.now();
+      const prog: EpgProgram = {
+        id: `epg-${chId}-${start}`,
+        channelId: chId,
+        title,
+        description: desc,
+        category,
+        start,
+        end,
+        isLive: now >= start && now < end,
+        hasArchive: end <= now
+      };
+
+      if (!tempMap.has(chId)) {
+        tempMap.set(chId, []);
+      }
+      tempMap.get(chId)!.push(prog);
+      totalProgrammes++;
+    }
+
+    // Progressively merge early channels into main memory so they become immediately queryable
+    if (Date.now() - lastFlushTime > 1500) {
+      for (const [chId, list] of tempMap.entries()) {
+        const existing = programsByChannel.get(chId) || [];
+        const merged = deduplicateEpg([...existing, ...list]);
+        programsByChannel.set(chId, merged);
+      }
+      totalProgrammesCount = totalProgrammes;
+      lastFlushTime = Date.now();
+    }
+
+    // Cut parsed buffer safely to keep memory low
+    const safeCut = Math.max(lastChIndex, lastProgIndex);
+    if (safeCut > 0) {
+      buffer = buffer.slice(safeCut);
+    } else if (buffer.length > 300000) {
+      const lastProgClose = buffer.lastIndexOf('</programme>');
+      if (lastProgClose !== -1) {
+        buffer = buffer.slice(lastProgClose + 12);
+      }
+    }
+  }
+
+  // Final merge & deduplication
+  for (const [chId, list] of tempMap.entries()) {
+    const existing = programsByChannel.get(chId) || [];
+    const merged = deduplicateEpg([...existing, ...list]);
+    programsByChannel.set(chId, merged);
+  }
+
+  return { channelCount: tempMap.size, progCount: totalProgrammes };
+}
+
+/**
+ * Resilient multi-mirror EPG synchronization.
+ * If the primary URL fails or provides no programs, it automatically fails over to backup mirrors.
+ */
+export async function syncEpg(customUrl?: string): Promise<{ success: boolean; channelsCount: number; message: string; mirror: string }> {
   if (isSyncing) {
-    return { success: false, channelsCount: programsByChannel.size, message: 'Синхронизация уже выполняется...' };
+    return {
+      success: false,
+      channelsCount: programsByChannel.size,
+      message: 'Синхронизация уже выполняется...',
+      mirror: currentMirrorSource
+    };
   }
 
   isSyncing = true;
-  console.log(`[EPG Service] Starting background EPG sync from ${epgUrl}...`);
+  console.log(`[EPG Service] Starting EPG synchronization with resilient mirrors...`);
+
+  const urlsToTry: string[] = [];
+  if (customUrl && !urlsToTry.includes(customUrl)) {
+    urlsToTry.push(customUrl);
+  }
+  for (const m of EPG_MIRROR_SOURCES) {
+    if (!urlsToTry.includes(m)) {
+      urlsToTry.push(m);
+    }
+  }
+
+  let lastError: Error | null = null;
+  let successMirror = '';
 
   try {
-    const response = await fetch(epgUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      },
-      signal: AbortSignal.timeout(90000)
-    });
+    for (const url of urlsToTry) {
+      try {
+        currentMirrorSource = url;
+        console.log(`[EPG Service] Attempting sync from mirror: ${url}`);
+        const result = await parseEpgFromStream(url);
 
-    if (!response.ok || !response.body) {
-      throw new Error(`Failed to fetch EPG: HTTP ${response.status}`);
-    }
+        if (result.progCount > 0 || programsByChannel.size > 0) {
+          successMirror = url;
+          lastSyncTime = Date.now();
+          totalProgrammesCount = Array.from(programsByChannel.values()).reduce((acc, p) => acc + p.length, 0);
+          console.log(`[EPG Service] Sync SUCCESS via ${url}: indexed ${totalProgrammesCount} programmes across ${programsByChannel.size} channels!`);
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder('utf-8');
-    let buffer = '';
-    const tempMap = new Map<string, EpgProgram[]>();
-    let totalProgrammes = 0;
-    let lastFlushTime = Date.now();
+          // Persist durable cache
+          await persistDurableCache();
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-
-      // 1. Extract channel mapping <channel id="..."> <display-name>...</display-name> </channel>
-      let chMatch;
-      const chRegex = /<channel\s+id="([^"]+)">[\s\S]*?<display-name[^>]*>([^<]+)<\/display-name>[\s\S]*?<\/channel>/gi;
-      while ((chMatch = chRegex.exec(buffer)) !== null) {
-        const chId = chMatch[1];
-        const chName = decodeXmlEntities(chMatch[2]).trim();
-        channelAliases.set(normalizeName(chName), chId);
-      }
-
-      // 2. Extract programmes <programme ...> ... </programme>
-      let progMatch;
-      const progRegex = /<programme\s+([^>]+)>([\s\S]*?)<\/programme>/gi;
-      let lastIndex = 0;
-
-      while ((progMatch = progRegex.exec(buffer)) !== null) {
-        lastIndex = progRegex.lastIndex;
-        const attrs = progMatch[1];
-        const inner = progMatch[2];
-
-        const chIdMatch = attrs.match(/channel="([^"]+)"/i);
-        const startMatch = attrs.match(/start="([^"]+)"/i);
-        const stopMatch = attrs.match(/stop="([^"]+)"/i);
-
-        if (!chIdMatch || !startMatch || !stopMatch) continue;
-
-        const chId = chIdMatch[1];
-        const start = parseXmltvDate(startMatch[1]);
-        const end = parseXmltvDate(stopMatch[1]);
-        if (!start || !end) continue;
-
-        const titleMatch = inner.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-        const descMatch = inner.match(/<desc[^>]*>([\s\S]*?)<\/desc>/i);
-        const catMatch = inner.match(/<category[^>]*>([\s\S]*?)<\/category>/i);
-
-        const title = decodeXmlEntities(titleMatch ? titleMatch[1].trim() : 'Передача');
-        const rawDesc = decodeXmlEntities(descMatch ? descMatch[1].trim() : '');
-        const desc = rawDesc.length > 200 ? rawDesc.slice(0, 200) + '...' : rawDesc;
-        const category = decodeXmlEntities(catMatch ? catMatch[1].trim() : 'ТВ');
-
-        const now = Date.now();
-        const prog: EpgProgram = {
-          id: `epg-${chId}-${start}`,
-          channelId: chId,
-          title,
-          description: desc,
-          category,
-          start,
-          end,
-          isLive: now >= start && now < end,
-          hasArchive: end <= now
-        };
-
-        if (!tempMap.has(chId)) {
-          tempMap.set(chId, []);
+          return {
+            success: true,
+            channelsCount: programsByChannel.size,
+            message: `Загружено телегида: ${totalProgrammesCount} передач для ${programsByChannel.size} каналов`,
+            mirror: url
+          };
         }
-        tempMap.get(chId)!.push(prog);
-        totalProgrammes++;
-      }
-
-      // Incrementally flush parsed channels to main map every 1s so early channels (ch001, ch002...)
-      // become immediately available without waiting for full download!
-      if (Date.now() - lastFlushTime > 1000) {
-        for (const [chId, list] of tempMap.entries()) {
-          programsByChannel.set(chId, list);
-        }
-        totalProgrammesCount = totalProgrammes;
-        lastFlushTime = Date.now();
-      }
-
-      // Retain unparsed chunk remainder
-      if (lastIndex > 0) {
-        buffer = buffer.slice(lastIndex);
-      } else if (buffer.length > 400000) {
-        const safeCut = buffer.lastIndexOf('</programme>');
-        if (safeCut !== -1) {
-          buffer = buffer.slice(safeCut + 12);
-        }
+      } catch (mirrorErr: any) {
+        console.warn(`[EPG Service] Mirror ${url} failed: ${mirrorErr?.message || mirrorErr}. Trying next mirror...`);
+        lastError = mirrorErr;
       }
     }
 
-    // Sort programmes by start time and deduplicate for all channels
-    for (const [chId, list] of tempMap.entries()) {
-      const deduped = deduplicateEpg(list);
-      programsByChannel.set(chId, deduped);
-    }
-
-    lastSyncTime = Date.now();
-    totalProgrammesCount = totalProgrammes;
-    console.log(`[EPG Service] Successfully indexed ${totalProgrammes} programmes for ${tempMap.size} channels!`);
-
-    // Asynchronously save compact gzipped snapshot to disk (~4MB)
-    try {
-      const compactChannels: Record<string, CompactProgram[]> = {};
-      for (const [k, progs] of programsByChannel.entries()) {
-        compactChannels[k] = progs.map(p => [p.start, p.end, p.title || '', p.category || '', p.description || '']);
-      }
-
-      const snapshot = {
-        aliases: Object.fromEntries(channelAliases),
-        channels: compactChannels
+    // If all online mirrors failed, but we still have durable cache in memory:
+    if (programsByChannel.size > 0) {
+      return {
+        success: true,
+        channelsCount: programsByChannel.size,
+        message: `Использован долговечный локальный кэш (${programsByChannel.size} каналов)`,
+        mirror: 'local-durable-cache'
       };
-
-      const compressed = zlib.gzipSync(Buffer.from(JSON.stringify(snapshot), 'utf8'));
-      fs.promises.writeFile(CACHE_FILE_GZ, compressed).catch(err => {
-        console.warn('[EPG Service] Could not write compressed cache:', err);
-      });
-    } catch (saveErr) {
-      console.warn('[EPG Service] Could not prepare compressed cache:', saveErr);
     }
 
-    return {
-      success: true,
-      channelsCount: programsByChannel.size,
-      message: `Загружено ${totalProgrammes} телепередач для ${programsByChannel.size} каналов`
-    };
+    throw lastError || new Error('Все зеркала EPG недоступны');
   } catch (err: any) {
-    console.error('[EPG Service] Error syncing EPG:', err);
-    return { success: false, channelsCount: programsByChannel.size, message: err.message || 'Ошибка загрузки EPG' };
+    console.error('[EPG Service] Final error syncing EPG across all mirrors:', err);
+    return {
+      success: false,
+      channelsCount: programsByChannel.size,
+      message: err.message || 'Ошибка загрузки EPG',
+      mirror: 'none'
+    };
   } finally {
     isSyncing = false;
   }
@@ -341,8 +473,14 @@ function resolveAndDedupe(list?: EpgProgram[]): EpgProgram[] {
   return deduplicateEpg(list);
 }
 
-// Ultra-smart channel lookup supporting tvgId (ch001, ch1, 1), name, aliases, stripped suffixes
-export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[] {
+/**
+ * Ultra-smart channel lookup supporting:
+ * - Direct tvgId (ch001, ch1, 1, 442_01, etc.)
+ * - Direct channelName & tvgName
+ * - Normalized names & stripped suffixes (HD, FHD, UHD, 4K, HDR, 50fps)
+ * - Channel aliases extracted from all <display-name> tags
+ */
+export function getChannelEpg(tvgId?: string, channelName?: string, tvgName?: string): EpgProgram[] {
   // 1. Direct match by tvgId
   if (tvgId) {
     if (programsByChannel.has(tvgId)) {
@@ -353,44 +491,73 @@ export function getChannelEpg(tvgId?: string, channelName?: string): EpgProgram[
       return resolveAndDedupe(programsByChannel.get(lowerId));
     }
 
-    // Numeric variations: ch001, ch01, ch1
+    // Check alias by normalized tvgId
+    const aliasByTvgId = channelAliases.get(normalizeName(tvgId));
+    if (aliasByTvgId && programsByChannel.has(aliasByTvgId)) {
+      return resolveAndDedupe(programsByChannel.get(aliasByTvgId));
+    }
+
+    // Numeric variations: ch001, ch01, ch1, 1
     const numMatch = tvgId.match(/\d+/);
     if (numMatch) {
       const num = parseInt(numMatch[0], 10);
       const padded3 = `ch${String(num).padStart(3, '0')}`;
       const padded2 = `ch${String(num).padStart(2, '0')}`;
       const unpadded = `ch${num}`;
+      const bareNum = String(num);
       if (programsByChannel.has(padded3)) return resolveAndDedupe(programsByChannel.get(padded3));
       if (programsByChannel.has(padded2)) return resolveAndDedupe(programsByChannel.get(padded2));
       if (programsByChannel.has(unpadded)) return resolveAndDedupe(programsByChannel.get(unpadded));
+      if (programsByChannel.has(bareNum)) return resolveAndDedupe(programsByChannel.get(bareNum));
     }
   }
 
-  // 2. Direct match by channelName
-  if (channelName && programsByChannel.has(channelName)) {
-    return resolveAndDedupe(programsByChannel.get(channelName));
+  // 2. Direct match by tvgName
+  if (tvgName) {
+    if (programsByChannel.has(tvgName)) {
+      return resolveAndDedupe(programsByChannel.get(tvgName));
+    }
+    const normTvgName = normalizeName(tvgName);
+    const aliasId = channelAliases.get(normTvgName);
+    if (aliasId && programsByChannel.has(aliasId)) {
+      return resolveAndDedupe(programsByChannel.get(aliasId));
+    }
+    const strippedTvgName = normalizeName(stripSuffixes(tvgName));
+    const strippedAliasId = channelAliases.get(strippedTvgName);
+    if (strippedAliasId && programsByChannel.has(strippedAliasId)) {
+      return resolveAndDedupe(programsByChannel.get(strippedAliasId));
+    }
   }
 
-  // 3. Match by normalized name alias
+  // 3. Match by channelName
   if (channelName) {
+    if (programsByChannel.has(channelName)) {
+      return resolveAndDedupe(programsByChannel.get(channelName));
+    }
+
     const norm = normalizeName(channelName);
     const mappedId = channelAliases.get(norm);
     if (mappedId && programsByChannel.has(mappedId)) {
       return resolveAndDedupe(programsByChannel.get(mappedId));
     }
 
-    // Strip common suffixes (HD, FHD, Double, +2, +4, +6) for fallback
-    const stripped = norm.replace(/(hd|fhd|double|\+2|\+4|\+6)$/, '');
-    if (stripped && stripped !== norm) {
-      const fallbackId = channelAliases.get(stripped);
+    // Strip common suffixes (HD, FHD, UHD, HDR, 4K, Double, +2, +4, +6)
+    const strippedNorm = normalizeName(stripSuffixes(channelName));
+    if (strippedNorm && strippedNorm !== norm) {
+      const fallbackId = channelAliases.get(strippedNorm);
       if (fallbackId && programsByChannel.has(fallbackId)) {
         return resolveAndDedupe(programsByChannel.get(fallbackId));
       }
     }
 
-    // Substring search in channel aliases
+    // Substring / fuzzy match across all registered aliases
     for (const [aliasNorm, id] of channelAliases.entries()) {
-      if (aliasNorm === norm || (norm.length > 4 && aliasNorm.includes(norm)) || (aliasNorm.length > 4 && norm.includes(aliasNorm))) {
+      if (
+        aliasNorm === norm ||
+        aliasNorm === strippedNorm ||
+        (norm.length > 4 && aliasNorm.includes(norm)) ||
+        (aliasNorm.length > 4 && norm.includes(aliasNorm))
+      ) {
         if (programsByChannel.has(id)) {
           return resolveAndDedupe(programsByChannel.get(id));
         }

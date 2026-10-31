@@ -19,7 +19,8 @@ import {
   AlertCircle,
   X,
   ArrowLeft,
-  Info
+  Info,
+  RefreshCw
 } from 'lucide-react';
 
 interface IptvPlayerProps {
@@ -191,6 +192,27 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }, 2800);
     return () => clearTimeout(timer);
   }, [toastMessage]);
+
+  // EPG forced reload trigger state
+  const [epgReloadKey, setEpgReloadKey] = useState(0);
+
+  // Manual forced reload of EPG from mirror sources
+  const handleForceReloadEpg = useCallback(async () => {
+    if (!selectedChannel) return;
+    showToast('Принудительное обновление телегида...');
+    epgCache.current.delete(selectedChannel.id);
+    setIsLoadingEpg(true);
+    setEpgList([]);
+    try {
+      await fetch('/api/iptv/epg/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ epgUrl: settings.epgUrl })
+      }).catch(() => {});
+    } finally {
+      setEpgReloadKey(prev => prev + 1);
+    }
+  }, [selectedChannel, settings.epgUrl, showToast]);
 
   // Format helpers with Moscow Timezone (Europe/Moscow, UTC+3) as standard for Russian IPTV/EPG
   const formatTime = useCallback((ms: number) => {
@@ -387,17 +409,17 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }
   }, []);
 
-  // Whenever selectedChannel changes, fetch REAL EPG from backend (with in-memory cache)
+  // Whenever selectedChannel changes or force-reload is requested, fetch REAL EPG from backend (with in-memory cache)
   useEffect(() => {
     if (!selectedChannel) return;
     let isCancelled = false;
     let retryTimer: NodeJS.Timeout | null = null;
 
-    // Check fast client cache
+    // Fast client cache check (ONLY if cached has programs, never lock on empty array)
     if (epgCache.current.has(selectedChannel.id)) {
       const cached = epgCache.current.get(selectedChannel.id)!;
-      const now = Date.now();
-      if (cached.length > 0) {
+      if (cached && cached.length > 0) {
+        const now = Date.now();
         const cleanCached = deduplicateClientEpg(cached);
         const programs = cleanCached.map(p => ({
           ...p,
@@ -412,19 +434,17 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         setIsArchiveMode(false);
         setIsLoadingEpg(false);
         return;
-      } else {
-        setEpgList([]);
-        setIsLoadingEpg(false);
-        return;
       }
     }
 
     setIsLoadingEpg(true);
     const tvgId = selectedChannel.tvgId || '';
     const name = selectedChannel.name || '';
+    const tvgName = selectedChannel.tvgName || '';
+    const forceParam = epgReloadKey > 0 ? '&force=true' : '';
 
     const fetchEpg = (attempt = 1) => {
-      fetch(`/api/iptv/epg?channelId=${encodeURIComponent(tvgId)}&name=${encodeURIComponent(name)}`)
+      fetch(`/api/iptv/epg?channelId=${encodeURIComponent(tvgId)}&name=${encodeURIComponent(name)}&tvgName=${encodeURIComponent(tvgName)}${forceParam}`)
         .then(res => (res.ok ? res.json() : []))
         .then((realPrograms: EpgProgram[]) => {
           if (isCancelled) return;
@@ -486,8 +506,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                     if (!isCancelled) fetchEpg(attempt + 1);
                   }, 1500);
                 } else {
-                  // Truly no EPG for this channel
-                  epgCache.current.set(selectedChannel.id, []);
+                  // No EPG returned yet — keep list empty and show fallback live, do NOT lock cache
                   setEpgList([]);
                   const fallbackLive: EpgProgram = {
                     id: `live-${selectedChannel.id}`,
@@ -509,7 +528,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               })
               .catch(() => {
                 if (isCancelled) return;
-                epgCache.current.set(selectedChannel.id, []);
                 setEpgList([]);
                 setIsLoadingEpg(false);
               });
@@ -517,7 +535,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         })
         .catch(() => {
           if (isCancelled) return;
-          epgCache.current.set(selectedChannel.id, []);
           setEpgList([]);
           setIsLoadingEpg(false);
         });
@@ -529,7 +546,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       isCancelled = true;
       if (retryTimer) clearTimeout(retryTimer);
     };
-  }, [selectedChannel?.id]);
+  }, [selectedChannel?.id, epgReloadKey]);
 
   // INSTANT AUTO-ALIGNMENT ON OVERLAY OPEN
   useEffect(() => {
@@ -1036,6 +1053,10 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             break;
 
           case 'OK':
+            if (filteredEpg.length === 0) {
+              handleForceReloadEpg();
+              break;
+            }
             if (filteredEpg[focusedProgramIndex]) {
               const prog = filteredEpg[focusedProgramIndex];
               const now = Date.now();
@@ -1740,13 +1761,38 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               </div>
             ) : filteredEpg.length === 0 ? (
               <div style={{ padding: '36px 16px', textAlign: 'center', color: '#94a3b8', fontSize: '13px' }}>
-                <Calendar style={{ width: '28px', height: '28px', margin: '0 auto 10px auto', color: '#64748b' }} />
-                <p style={{ margin: 0, fontWeight: 'bold' }}>
-                  {epgList.length > 0 ? 'Нет программы на выбранный день' : 'Программа передач для этого канала отсутствует'}
+                <Calendar style={{ width: '32px', height: '32px', margin: '0 auto 10px auto', color: '#64748b' }} />
+                <p style={{ margin: 0, fontWeight: 'bold', fontSize: '14px', color: '#f8fafc' }}>
+                  {epgList.length > 0 ? 'Нет программы на выбранный день' : 'Программа передач не загружена'}
                 </p>
-                <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#64748b' }}>
-                  {epgList.length > 0 ? 'Используйте ◄ ► для выбора дня с записями архива' : 'Прямой эфир доступен для просмотра'}
+                <p style={{ margin: '6px 0 16px 0', fontSize: '12px', color: '#64748b', lineHeight: 1.4 }}>
+                  {epgList.length > 0 ? 'Используйте ◄ ► для выбора дня с записями' : 'Прямой эфир доступен. Нажмите кнопку ниже или кнопку ОК на пульте для загрузки программы.'}
                 </p>
+
+                <button
+                  id="btn-force-reload-epg"
+                  onClick={handleForceReloadEpg}
+                  disabled={isLoadingEpg}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '8px',
+                    padding: '10px 18px',
+                    borderRadius: '8px',
+                    backgroundColor: '#0284c7',
+                    border: '2px solid #38bdf8',
+                    color: '#ffffff',
+                    fontWeight: 'bold',
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                    boxShadow: '0 0 16px rgba(56, 189, 248, 0.4)',
+                    transition: 'all 0.15s ease'
+                  }}
+                >
+                  <RefreshCw style={{ width: '15px', height: '15px', animation: isLoadingEpg ? 'spin 1s linear infinite' : 'none' }} />
+                  {isLoadingEpg ? 'Загрузка...' : 'Загрузить программу (ОК)'}
+                </button>
               </div>
             ) : (
               filteredEpg.map((prog, idx) => {
@@ -1870,7 +1916,9 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             }}
           >
             <span>▲▼ Передачи · ◄► Дни архива</span>
-            <span style={{ color: '#38bdf8', fontWeight: 'bold' }}>ОК: Смотреть</span>
+            <span style={{ color: '#38bdf8', fontWeight: 'bold' }}>
+              {filteredEpg.length === 0 ? 'ОК: Загрузить EPG' : 'ОК: Смотреть'}
+            </span>
           </div>
         </div>
       )}

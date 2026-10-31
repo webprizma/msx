@@ -365,7 +365,19 @@ function cleanCategory(raw: string): string {
 app.get('/api/iptv/epg', (req, res) => {
   const channelId = (req.query.channelId as string) || (req.query.tvgId as string) || '';
   const name = (req.query.name as string) || '';
-  const programs = getChannelEpg(channelId, name);
+  const tvgName = (req.query.tvgName as string) || '';
+  const force = req.query.force === 'true';
+
+  let programs = getChannelEpg(channelId, name, tvgName);
+
+  // If forced reload and still 0 programs, trigger background sync if not already syncing
+  if (force && programs.length === 0) {
+    const status = getEpgSyncStatus();
+    if (!status.isSyncing) {
+      syncEpg(iptvSettings.epgUrl).catch(e => console.warn('[EPG Force Sync]', e));
+    }
+  }
+
   res.json(programs);
 });
 
