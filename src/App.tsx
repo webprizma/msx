@@ -1,26 +1,16 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { MsxPlaylist } from './types/msx';
 import { INITIAL_DEFAULT_PLAYLIST } from './data/presets';
 import { Header } from './components/Header';
-import { Simulator } from './components/Simulator';
 import { Builder } from './components/Builder';
-import { PitfallsGuide } from './components/PitfallsGuide';
-import { HostingTemplates } from './components/HostingTemplates';
-import { RoadmapPlan } from './components/RoadmapPlan';
-import { JsonViewer } from './components/JsonViewer';
 import { IptvPlayer } from './components/IptvPlayer';
 import {
-  Tv,
-  CheckCircle2,
   Copy,
   Check,
   ExternalLink,
-  Sparkles,
-  Layers,
-  ShieldAlert,
-  Server,
-  FileCode,
-  ListTodo
+  Wifi,
+  WifiOff,
+  Edit3
 } from 'lucide-react';
 
 export default function App() {
@@ -40,9 +30,24 @@ export default function App() {
   const [playlist, setPlaylist] = useState<MsxPlaylist>(INITIAL_DEFAULT_PLAYLIST);
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+
+  // Real TV Address (e.g. 192.168.1.244 or window host)
+  const [tvAddress, setTvAddress] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      const isStandardPort = window.location.port === '80' || window.location.port === '443' || !window.location.port;
+      return isStandardPort ? window.location.hostname : window.location.host;
+    }
+    return '192.168.1.244';
+  });
+  const [isEditingTvAddress, setIsEditingTvAddress] = useState(false);
+
   const [serverUrl, setServerUrl] = useState('');
   const [isCopied, setIsCopied] = useState(false);
-  const [isServerHealthy, setIsServerHealthy] = useState<boolean | null>(null);
+  const [isCopiedFullUrl, setIsCopiedFullUrl] = useState(false);
+
+  // Real Server Health Status & Latency
+  const [serverHealth, setServerHealth] = useState<'active' | 'checking' | 'error'>('checking');
+  const [serverLatency, setServerLatency] = useState<number | null>(null);
 
   // If directly opened as TV app (/tv or full-screen mode), render clean video view with ZERO headers, banners or scrollbars
   if (isTvFullscreen) {
@@ -62,7 +67,7 @@ export default function App() {
     );
   }
 
-  // Helper to ensure each menu and item has a unique ID (MSX standard JSON doesn't require id)
+  // Helper to ensure each menu and item has a unique ID
   const normalizePlaylist = (raw: any): MsxPlaylist => {
     if (!raw || typeof raw !== 'object') return INITIAL_DEFAULT_PLAYLIST;
     const menu = Array.isArray(raw.menu) ? raw.menu.map((m: any, mIdx: number) => ({
@@ -91,13 +96,40 @@ export default function App() {
     };
   };
 
-  // Determine current live MSX endpoint URL
+  // Real Server Heartbeat Check
+  const checkServerHealth = useCallback(async () => {
+    const t0 = performance.now();
+    try {
+      const res = await fetch('/api/msx/start.json', {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(4000)
+      });
+      const t1 = performance.now();
+      if (res.ok) {
+        setServerLatency(Math.round(t1 - t0));
+        setServerHealth('active');
+      } else {
+        setServerHealth('error');
+      }
+    } catch (e) {
+      setServerHealth('error');
+    }
+  }, []);
+
+  // Determine current live MSX endpoint URL & load initial playlist
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      const liveEndpoint = `${window.location.origin}/api/msx/start.json`;
-      setServerUrl(liveEndpoint);
+      const origin = window.location.origin;
+      const isStandardPort = window.location.port === '80' || window.location.port === '443' || !window.location.port;
+      const defaultHost = isStandardPort ? window.location.hostname : window.location.host;
+      setTvAddress(defaultHost || '192.168.1.244');
+      setServerUrl(`${origin}/msx/start.json`);
 
-      // Fetch initial state from server
+      // Initial health check
+      checkServerHealth();
+      const timer = setInterval(checkServerHealth, 15000);
+
+      // Fetch initial playlist state from server
       fetch('/api/msx/playlist')
         .then((res) => {
           if (res.ok) return res.json();
@@ -106,15 +138,13 @@ export default function App() {
         .then((data) => {
           if (data && data.menu) {
             setPlaylist(normalizePlaylist(data));
-            setIsServerHealthy(true);
           }
         })
-        .catch(() => {
-          // Fallback to local preset if backend is not ready
-          setIsServerHealthy(false);
-        });
+        .catch(() => {});
+
+      return () => clearInterval(timer);
     }
-  }, []);
+  }, [checkServerHealth]);
 
   const handleUpdateAndSavePlaylist = async (newPlaylist: MsxPlaylist) => {
     setPlaylist(newPlaylist);
@@ -145,10 +175,17 @@ export default function App() {
     await handleUpdateAndSavePlaylist(playlist);
   };
 
-  const handleCopyEndpoint = () => {
-    navigator.clipboard.writeText(serverUrl);
+  const handleCopyTvAddress = () => {
+    navigator.clipboard.writeText(tvAddress);
     setIsCopied(true);
     setTimeout(() => setIsCopied(false), 2000);
+  };
+
+  const handleCopyFullUrl = () => {
+    const fullUrl = serverUrl || `http://${tvAddress}/msx/start.json`;
+    navigator.clipboard.writeText(fullUrl);
+    setIsCopiedFullUrl(true);
+    setTimeout(() => setIsCopiedFullUrl(false), 2000);
   };
 
   return (
@@ -157,75 +194,113 @@ export default function App() {
       <Header
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        tvAddress={tvAddress}
         serverUrl={serverUrl}
       />
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 flex flex-col gap-6">
-        {/* Live Server Hero Banner */}
+        {/* Real Live Server Status & TV Address Hero Banner */}
         <div className="relative rounded-2xl p-5 bg-gradient-to-r from-sky-950/40 via-slate-900 to-indigo-950/30 border border-sky-500/20 shadow-xl overflow-hidden">
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 relative z-10">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-5 relative z-10">
             <div>
-              <div className="flex items-center gap-2 mb-1">
-                <span className="text-sky-400 font-bold text-sm tracking-tight flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                  Живой сервер Media Station X запущен и активен
-                </span>
+              {/* Live Server Indicator */}
+              <div className="flex items-center gap-2 mb-2 flex-wrap">
+                {serverHealth === 'active' ? (
+                  <span className="text-emerald-400 font-bold text-sm tracking-tight flex items-center gap-2">
+                    <span className="relative flex h-2.5 w-2.5">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                    </span>
+                    Живой сервер Media Station X запущен и активен
+                  </span>
+                ) : serverHealth === 'checking' ? (
+                  <span className="text-amber-400 font-bold text-sm tracking-tight flex items-center gap-2">
+                    <span className="h-2.5 w-2.5 rounded-full bg-amber-400 animate-pulse"></span>
+                    Проверка связи с сервером MSX...
+                  </span>
+                ) : (
+                  <span className="text-rose-400 font-bold text-sm tracking-tight flex items-center gap-2">
+                    <WifiOff className="w-3.5 h-3.5" />
+                    Сервер Media Station X временно недоступен
+                  </span>
+                )}
+
                 <span className="text-slate-500 text-xs">·</span>
-                <span className="text-slate-400 text-xs">CORS: разрешен</span>
+                {serverLatency !== null && serverHealth === 'active' && (
+                  <>
+                    <span className="text-emerald-300 font-mono text-xs bg-emerald-950/50 px-2 py-0.5 rounded border border-emerald-500/30">
+                      200 OK · {serverLatency} мс
+                    </span>
+                    <span className="text-slate-500 text-xs">·</span>
+                  </>
+                )}
+                <span className="text-slate-400 text-xs">CORS: разрешен (любые клиенты)</span>
               </div>
+
+              {/* Instructions */}
               <p className="text-xs text-slate-300 max-w-2xl leading-relaxed">
-                Вы можете прямо сейчас протестировать ваш портал на реальном телевизоре. Откройте на ТВ: <span className="text-white font-medium">Media Station X ➔ Настройки (шестерёнка) ➔ Start Parameter ➔ Setup</span> и введите этот адрес:
+                На реальном телевизоре откройте приложение: <span className="text-white font-medium">Media Station X ➔ Настройки (шестерёнка) ➔ Start Parameter ➔ Setup</span> и введите адрес:
               </p>
             </div>
 
-            <div className="flex items-center gap-2 bg-slate-950/80 p-2 rounded-xl border border-sky-500/30 shrink-0">
-              <code className="text-xs font-mono text-sky-300 px-2 py-1 select-all max-w-[280px] sm:max-w-[340px] truncate">
-                {serverUrl || 'Загрузка...'}
-              </code>
-              <button
-                onClick={handleCopyEndpoint}
-                className="p-2 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 transition-colors cursor-pointer"
-                title="Скопировать ссылку для ТВ"
-              >
-                {isCopied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
-              </button>
-              <a
-                href="/api/msx/start.json"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors cursor-pointer"
-                title="Открыть сырой JSON в браузере"
-              >
-                <ExternalLink className="w-4 h-4" />
-              </a>
+            {/* TV Address Display with Direct Copy Button */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 shrink-0">
+              <div className="flex items-center gap-2 bg-slate-950/90 px-3 py-2 rounded-xl border border-sky-500/40 shadow-inner">
+                <span className="text-[10px] font-semibold text-sky-400 uppercase tracking-wider select-none shrink-0">
+                  Для ТВ:
+                </span>
+                {isEditingTvAddress ? (
+                  <input
+                    type="text"
+                    value={tvAddress}
+                    onChange={(e) => setTvAddress(e.target.value.trim())}
+                    onBlur={() => setIsEditingTvAddress(false)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') setIsEditingTvAddress(false);
+                    }}
+                    autoFocus
+                    className="text-sm font-mono font-bold text-white bg-slate-900 px-2 py-1 rounded border border-sky-400 outline-none w-36"
+                  />
+                ) : (
+                  <span
+                    onClick={() => setIsEditingTvAddress(true)}
+                    className="text-sm font-mono font-bold text-sky-200 hover:text-white px-1 select-all cursor-pointer underline decoration-dotted decoration-sky-500/50"
+                    title="Нажмите, чтобы изменить IP адрес вручную (например, 192.168.1.244)"
+                  >
+                    {tvAddress}
+                  </span>
+                )}
+
+                <button
+                  onClick={() => setIsEditingTvAddress(!isEditingTvAddress)}
+                  className="p-1 rounded text-slate-400 hover:text-sky-300 transition-colors cursor-pointer"
+                  title="Изменить адрес сервера"
+                >
+                  <Edit3 className="w-3.5 h-3.5" />
+                </button>
+
+                <button
+                  onClick={handleCopyTvAddress}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-xs transition-colors cursor-pointer ml-1 shadow-md shadow-sky-500/20"
+                  title="Скопировать параметр для ввода пультом"
+                >
+                  {isCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{isCopied ? 'Скопировано!' : 'Скопировать'}</span>
+                </button>
+
+                <a
+                  href="/msx/start.json"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors cursor-pointer"
+                  title="Открыть стартовый JSON в новой вкладке"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              </div>
             </div>
           </div>
-        </div>
-
-        {/* Mobile/Compact Secondary Tab Strip */}
-        <div className="flex lg:hidden items-center gap-1.5 overflow-x-auto no-scrollbar pb-2">
-          {[
-            { id: 'iptv', label: 'IPTV (Архив)' },
-            { id: 'builder', label: 'Конструктор' },
-            { id: 'simulator', label: 'Симулятор ТВ' },
-            { id: 'pitfalls', label: 'Подводные камни' },
-            { id: 'templates', label: 'Шаблоны серверов' },
-            { id: 'roadmap', label: 'План внедрения' },
-            { id: 'json', label: 'JSON Плейлист' }
-          ].map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap cursor-pointer transition-colors ${
-                activeTab === tab.id
-                  ? 'bg-sky-500 text-slate-950 font-bold'
-                  : 'bg-slate-900 text-slate-400 hover:text-white'
-              }`}
-            >
-              {tab.label}
-            </button>
-          ))}
         </div>
 
         {/* Tab Views */}
@@ -246,35 +321,12 @@ export default function App() {
             saveMessage={saveMessage}
           />
         )}
-
-        {activeTab === 'simulator' && (
-          <Simulator playlist={playlist} />
-        )}
-
-        {activeTab === 'pitfalls' && (
-          <PitfallsGuide />
-        )}
-
-        {activeTab === 'templates' && (
-          <HostingTemplates />
-        )}
-
-        {activeTab === 'roadmap' && (
-          <RoadmapPlan />
-        )}
-
-        {activeTab === 'json' && (
-          <JsonViewer
-            playlist={playlist}
-            onImportPlaylist={(imported) => setPlaylist(normalizePlaylist(imported))}
-          />
-        )}
       </main>
 
-      {/* Footer */}
-      <footer className="mt-auto border-t border-slate-900 py-6 px-6 text-center text-xs text-slate-500">
+      {/* Clean Compact Footer */}
+      <footer className="mt-auto border-t border-slate-900 py-4 px-6 text-center text-xs text-slate-500">
         <p>
-          Media Station X Home Server Station — руководство, генератор плейлистов и симулятор для Smart TV (LG webOS, Samsung Tizen, Android TV).
+          Media Station X Server Studio — сервер домашнего медиа-портала и IPTV плеер с 7-дневным архивом передач.
         </p>
       </footer>
     </div>

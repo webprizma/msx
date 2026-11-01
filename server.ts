@@ -337,8 +337,16 @@ app.get('/api/iptv/settings', (req, res) => {
 app.post('/api/iptv/settings', async (req, res) => {
   try {
     const oldEpgUrl = iptvSettings.epgUrl;
+    const oldPlaylistUrl = iptvSettings.playlistUrl;
     iptvSettings = { ...iptvSettings, ...req.body };
     fs.writeFileSync(IPTV_SETTINGS_FILE, JSON.stringify(iptvSettings, null, 2), 'utf8');
+
+    // If playlist URL was changed, clear channel cache and fetch immediately
+    if (req.body.playlistUrl && req.body.playlistUrl !== oldPlaylistUrl) {
+      cachedChannels = [];
+      lastPlaylistFetchTime = 0;
+      fetchAndCacheChannels(req.body.playlistUrl, true).catch(e => console.error('[IPTV Playlist Change]', e));
+    }
 
     // If EPG URL was changed, trigger re-sync in background
     if (req.body.epgUrl && req.body.epgUrl !== oldEpgUrl) {
