@@ -30,7 +30,7 @@ interface IptvPlayerProps {
   onBackToMenu?: () => void;
 }
 
-type OverlayMode = 'none' | 'channels' | 'epg' | 'prompt' | 'timeline' | 'settings';
+type OverlayMode = 'none' | 'channels' | 'epg' | 'prompt' | 'timeline';
 
 // Helper: deduplicate programs, keeping the version with the richer description
 function deduplicateClientEpg(programs: EpgProgram[]): EpgProgram[] {
@@ -157,10 +157,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     archiveDays: 7,
     providerType: 'tvteam'
   });
-  const [inputUrl, setInputUrl] = useState(settings.playlistUrl);
-  const [inputEpgUrl, setInputEpgUrl] = useState(settings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442');
-  const [isSavingSettings, setIsSavingSettings] = useState(false);
-  const [isSyncingEpg, setIsSyncingEpg] = useState(false);
   const [isLoadingEpg, setIsLoadingEpg] = useState(false);
 
   // Stable refs to prevent callback re-creations and avoid circular effect re-triggers
@@ -329,14 +325,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     fetch('/api/iptv/settings')
       .then(res => res.ok ? res.json() : null)
       .then(data => {
-        if (data) {
-          if (data.playlistUrl) {
-            setSettings(prev => ({ ...prev, ...data }));
-            setInputUrl(data.playlistUrl);
-          }
-          if (data.epgUrl) {
-            setInputEpgUrl(data.epgUrl);
-          }
+        if (data && data.playlistUrl) {
+          setSettings(prev => ({ ...prev, ...data }));
         }
       })
       .catch(() => {});
@@ -935,72 +925,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   }, []);
 
   // Save Settings handler
-  const handleSaveSettings = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsSavingSettings(true);
-    try {
-      const newSettings: IptvSettings = {
-        ...settings,
-        playlistUrl: inputUrl,
-        epgUrl: inputEpgUrl
-      };
-      await fetch('/api/iptv/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newSettings)
-      });
-      setSettings(newSettings);
-      setOverlayMode('channels');
-      showToast('Плейлист сохранён! Обновление списка каналов...');
-      await loadChannels(inputUrl, 1);
-      // Background re-fetch live program map
-      fetch('/api/iptv/epg/live')
-        .then(r => r.json())
-        .then(map => {
-          if (map && typeof map === 'object') setLiveProgramsMap(map);
-        })
-        .catch(() => {});
-    } catch (e: any) {
-      showToast('Ошибка при сохранении настроек');
-    } finally {
-      setIsSavingSettings(false);
-    }
-  };
-
-  // Manual EPG Sync handler
-  const handleSyncEpg = async () => {
-    setIsSyncingEpg(true);
-    showToast('Синхронизация EPG запущена...');
-    try {
-      const res = await fetch('/api/iptv/epg/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ epgUrl: inputEpgUrl })
-      });
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message || 'Телепрограмма успешно загружена!');
-        // Refresh EPG for currently selected channel
-        if (selectedChannel) {
-          const epgRes = await fetch(`/api/iptv/epg?channelId=${encodeURIComponent(selectedChannel.tvgId || '')}&name=${encodeURIComponent(selectedChannel.name)}`);
-          if (epgRes.ok) {
-            const list = await epgRes.json();
-            if (Array.isArray(list) && list.length > 0) {
-              const now = Date.now();
-              setEpgList(list.map(p => ({ ...p, isLive: now >= p.start && now < p.end, hasArchive: p.end <= now })));
-            }
-          }
-        }
-      } else {
-        showToast(data.message || 'Ошибка обновления EPG');
-      }
-    } catch (e: any) {
-      showToast(`Ошибка сети: ${e.message}`);
-    } finally {
-      setIsSyncingEpg(false);
-    }
-  };
-
   // Keep focus on root container for TV remote events
   useEffect(() => {
     containerRef.current?.focus();
@@ -1064,38 +988,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   // TV REMOTE EVENT HANDLER
   useEffect(() => {
     const handleTvKey = (e: KeyboardEvent) => {
-      // If typing in input/textarea/select, do NOT prevent default or hijack arrow/backspace keys!
-      const activeTag = (document.activeElement?.tagName || '').toLowerCase();
-      if (activeTag === 'input' || activeTag === 'textarea' || activeTag === 'select') {
-        if (e.key === 'Escape' || e.keyCode === 27 || e.keyCode === 10009 || e.keyCode === 461) {
-          (document.activeElement as HTMLElement)?.blur();
-          setOverlayMode('channels');
-        }
-        return;
-      }
-
-      // Shortcut to open/toggle Settings: key 's' / 'S', keycode 83, 448 (Settings on TV), 406 (Blue button), 403 (Red button)
-      if (
-        e.key === 's' || e.key === 'S' ||
-        e.keyCode === 83 || e.keyCode === 448 || e.keyCode === 406 || e.keyCode === 403
-      ) {
-        e.preventDefault();
-        e.stopPropagation();
-        setOverlayMode(prev => prev === 'settings' ? 'none' : 'settings');
-        return;
-      }
-
       const action = normalizeTvKey(e);
-
-      // If in Settings overlay, allow user to close with BACK
-      if (overlayMode === 'settings') {
-        if (action === 'BACK' || action === 'Escape') {
-          e.preventDefault();
-          e.stopPropagation();
-          setOverlayMode('channels');
-        }
-        return;
-      }
 
       if (['UP', 'DOWN', 'LEFT', 'RIGHT', 'OK', 'BACK'].includes(action)) {
         e.preventDefault();
@@ -1726,29 +1619,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               <span className="hidden sm:inline">Режим ТВ</span>
             </button>
           )}
-
-          <button
-            onClick={() => setOverlayMode(m => m === 'settings' ? 'none' : 'settings')}
-            title="Настройки плейлиста и EPG (кнопка S на пульте)"
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '8px 14px',
-              backgroundColor: overlayMode === 'settings' ? '#0284c7' : 'rgba(15, 23, 42, 0.85)',
-              backdropFilter: 'blur(8px)',
-              border: '1px solid rgba(56, 189, 248, 0.4)',
-              borderRadius: '12px',
-              color: '#ffffff',
-              fontSize: '12px',
-              fontWeight: 600,
-              cursor: 'pointer',
-              boxShadow: '0 4px 15px rgba(0,0,0,0.5)'
-            }}
-          >
-            <Settings style={{ width: '16px', height: '16px', color: '#38bdf8' }} />
-            <span>Плейлист & EPG (S)</span>
-          </button>
         </div>
       </div>
 
@@ -1777,7 +1647,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           <span><b style={{ color: '#38bdf8' }}>ОК:</b> Список каналов</span>
           <span><b style={{ color: '#38bdf8' }}>▼:</b> Таймшифт & Перемотка</span>
           <span><b style={{ color: '#38bdf8' }}>◄ ►:</b> -1 мин / +1 мин</span>
-          <span><b style={{ color: '#38bdf8' }}>⚙ S:</b> Настройки</span>
         </div>
       )}
 
@@ -1818,40 +1687,18 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                 {filteredChannels.length} каналов · <b style={{ color: '#38bdf8' }}>OK:</b> открыть передачу
               </p>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <button
-                onClick={() => setOverlayMode('settings')}
-                title="Настройки плейлиста (кнопка S на пульте)"
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '5px',
-                  background: 'rgba(30, 41, 59, 0.9)',
-                  border: '1px solid rgba(56, 189, 248, 0.4)',
-                  color: '#38bdf8',
-                  borderRadius: '8px',
-                  padding: '6px 10px',
-                  fontSize: '12px',
-                  fontWeight: 'bold',
-                  cursor: 'pointer'
-                }}
-              >
-                <Settings style={{ width: '14px', height: '14px' }} />
-                <span>Настройки (S)</span>
-              </button>
-              <button
-                onClick={() => setOverlayMode('none')}
-                style={{
-                  background: 'transparent',
-                  border: 'none',
-                  color: '#94a3b8',
-                  cursor: 'pointer',
-                  padding: '4px'
-                }}
-              >
-                <X style={{ width: '20px', height: '20px' }} />
-              </button>
-            </div>
+            <button
+              onClick={() => setOverlayMode('none')}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#94a3b8',
+                cursor: 'pointer',
+                padding: '4px'
+              }}
+            >
+              <X style={{ width: '20px', height: '20px' }} />
+            </button>
           </div>
 
           {/* Category Tabs */}
@@ -1895,26 +1742,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                 </button>
               );
             })}
-            <button
-              onClick={() => setOverlayMode('settings')}
-              style={{
-                padding: '7px 14px',
-                borderRadius: '8px',
-                fontSize: '12px',
-                fontWeight: 'bold',
-                whiteSpace: 'nowrap',
-                cursor: 'pointer',
-                border: '1px solid rgba(56, 189, 248, 0.4)',
-                backgroundColor: 'rgba(14, 165, 233, 0.15)',
-                color: '#38bdf8',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '5px'
-              }}
-            >
-              <Settings style={{ width: '13px', height: '13px' }} />
-              <span>⚙ Настройки</span>
-            </button>
           </div>
 
           {/* Channel Items List: High-Performance Virtualized Windowed Renderer */}
@@ -2669,285 +2496,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         </div>
       )}
 
-      {/* 7. SETTINGS MODAL (Web & Smart TV remote friendly) */}
-      {overlayMode === 'settings' && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            backgroundColor: 'rgba(0, 0, 0, 0.88)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 60,
-            padding: '16px'
-          }}
-        >
-          <div
-            style={{
-              width: '560px',
-              maxWidth: '92vw',
-              maxHeight: '92vh',
-              overflowY: 'auto',
-              padding: '24px',
-              borderRadius: '24px',
-              backgroundColor: '#0b1120',
-              border: '2px solid rgba(56, 189, 248, 0.5)',
-              boxShadow: '0 12px 50px rgba(0,0,0,0.95)',
-              display: 'flex',
-              flexDirection: 'column'
-            }}
-          >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', borderBottom: '1px solid rgba(51, 65, 85, 0.8)', paddingBottom: '12px' }}>
-              <div>
-                <h3 style={{ fontSize: '18px', fontWeight: 'bold', color: '#ffffff', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <Settings style={{ width: '20px', height: '20px', color: '#38bdf8' }} />
-                  Настройки IPTV и Плейлиста
-                </h3>
-                <p style={{ fontSize: '11px', color: '#94a3b8', margin: '3px 0 0 0' }}>
-                  Для Smart TV и Web: измените плейлист или выберите провайдера
-                </p>
-              </div>
-              <button
-                onClick={() => setOverlayMode('channels')}
-                style={{
-                  background: 'rgba(30, 41, 59, 0.8)',
-                  border: '1px solid rgba(51, 65, 85, 0.8)',
-                  borderRadius: '8px',
-                  color: '#94a3b8',
-                  padding: '6px 10px',
-                  cursor: 'pointer',
-                  fontSize: '12px'
-                }}
-                title="Закрыть (кнопка BACK на пульте)"
-              >
-                ✕ Закрыть
-              </button>
-            </div>
-
-            {/* Quick Provider Presets */}
-            <div style={{ marginBottom: '16px' }}>
-              <label style={{ display: 'block', color: '#cbd5e1', fontSize: '12px', fontWeight: 'bold', marginBottom: '8px' }}>
-                Быстрый выбор провайдера:
-              </label>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px' }}>
-                {[
-                  {
-                    name: 'TV.Team (Текущий)',
-                    playlist: 'http://rus.hls.gd/pl/19/61bbpl1xj1srq/playlist.m3u8',
-                    epg: 'https://rus.epg.team/7.1.xml?pkg=442',
-                    archive: 7
-                  },
-                  {
-                    name: 'ILookTV / Edem',
-                    playlist: 'https://vip-tv.fun/api/playlist/ВАШ_КЛЮЧ/m3u8',
-                    epg: 'https://epg.it999.ru/edem.xml.gz',
-                    archive: 4
-                  },
-                  {
-                    name: 'Glanz TV',
-                    playlist: 'http://ottg.tv/ВАШ_ОТТ_КЛЮЧ/playlist.m3u8',
-                    epg: 'https://epg.it999.ru/epg2.xml.gz',
-                    archive: 7
-                  },
-                  {
-                    name: 'CBilling',
-                    playlist: 'http://cbilling.tv/ВАШ_ТОКЕН/playlist.m3u8',
-                    epg: 'http://programtv.ru/xmltv.xml.gz',
-                    archive: 7
-                  }
-                ].map((prov) => (
-                  <button
-                    key={prov.name}
-                    type="button"
-                    onClick={() => {
-                      setInputUrl(prov.playlist);
-                      setInputEpgUrl(prov.epg);
-                      setSettings(prev => ({ ...prev, archiveDays: prov.archive }));
-                      showToast(`Выбран шаблон ${prov.name}`);
-                    }}
-                    style={{
-                      padding: '8px 12px',
-                      borderRadius: '10px',
-                      backgroundColor: inputUrl === prov.playlist ? '#0284c7' : 'rgba(30, 41, 59, 0.7)',
-                      border: inputUrl === prov.playlist ? '2px solid #38bdf8' : '1px solid rgba(51, 65, 85, 0.8)',
-                      color: '#ffffff',
-                      fontSize: '12px',
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                      textAlign: 'left',
-                      transition: 'all 0.15s ease'
-                    }}
-                  >
-                    {prov.name}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <form onSubmit={handleSaveSettings} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              <div>
-                <label style={{ display: 'block', color: '#cbd5e1', fontSize: '12px', fontWeight: 'bold', marginBottom: '6px' }}>
-                  Ссылка на M3U / M3U8 плейлист:
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={inputUrl}
-                  onChange={(e) => setInputUrl(e.target.value)}
-                  placeholder="http://rus.hls.gd/pl/19/.../playlist.m3u8"
-                  style={{
-                    width: '100%',
-                    padding: '10px 14px',
-                    borderRadius: '8px',
-                    backgroundColor: '#020617',
-                    border: '1px solid #334155',
-                    color: '#ffffff',
-                    fontFamily: 'monospace',
-                    fontSize: '12px',
-                    outline: 'none',
-                    boxSizing: 'border-box'
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', color: '#cbd5e1', fontSize: '12px', fontWeight: 'bold', marginBottom: '6px' }}>
-                  Ссылка на телегид EPG (XMLTV):
-                </label>
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <input
-                    type="text"
-                    value={inputEpgUrl}
-                    onChange={(e) => setInputEpgUrl(e.target.value)}
-                    placeholder="https://rus.epg.team/7.1.xml?pkg=442"
-                    style={{
-                      flex: 1,
-                      padding: '10px 14px',
-                      borderRadius: '8px',
-                      backgroundColor: '#020617',
-                      border: '1px solid #334155',
-                      color: '#ffffff',
-                      fontFamily: 'monospace',
-                      fontSize: '12px',
-                      outline: 'none',
-                      boxSizing: 'border-box'
-                    }}
-                  />
-                  <button
-                    type="button"
-                    onClick={handleSyncEpg}
-                    disabled={isSyncingEpg}
-                    style={{
-                      padding: '10px 14px',
-                      borderRadius: '8px',
-                      backgroundColor: isSyncingEpg ? '#334155' : 'rgba(56, 189, 248, 0.2)',
-                      border: '1px solid rgba(56, 189, 248, 0.4)',
-                      color: '#38bdf8',
-                      fontSize: '11px',
-                      fontWeight: 'bold',
-                      cursor: isSyncingEpg ? 'not-allowed' : 'pointer',
-                      whiteSpace: 'nowrap'
-                    }}
-                  >
-                    {isSyncingEpg ? 'Загрузка...' : 'Обновить EPG'}
-                  </button>
-                </div>
-                <p style={{ fontSize: '11px', color: '#64748b', margin: '4px 0 0 0' }}>
-                  TV.Team 7 дней архива: <span style={{ color: '#94a3b8', fontFamily: 'monospace' }}>https://rus.epg.team/7.1.xml?pkg=442</span>
-                </p>
-              </div>
-
-              <div>
-                <label style={{ display: 'block', color: '#cbd5e1', fontSize: '12px', fontWeight: 'bold', marginBottom: '6px' }}>
-                  Глубина архива: {settings.archiveDays} дней
-                </label>
-                <input
-                  type="range"
-                  min="1"
-                  max="7"
-                  value={settings.archiveDays}
-                  onChange={(e) => setSettings({ ...settings, archiveDays: parseInt(e.target.value, 10) })}
-                  style={{ width: '100%' }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', color: '#cbd5e1', fontSize: '12px', fontWeight: 'bold', marginBottom: '6px' }}>
-                  Часовой пояс телепрограммы (EPG):
-                </label>
-                <select
-                  value={settings.timeZoneOffset === undefined ? 'auto' : settings.timeZoneOffset}
-                  onChange={(e) => {
-                    const val = e.target.value === 'auto' ? 'auto' : parseInt(e.target.value, 10);
-                    setSettings({ ...settings, timeZoneOffset: val });
-                  }}
-                  style={{
-                    width: '100%',
-                    padding: '10px 14px',
-                    borderRadius: '8px',
-                    backgroundColor: '#020617',
-                    border: '1px solid #334155',
-                    color: '#ffffff',
-                    fontSize: '12px',
-                    outline: 'none',
-                    boxSizing: 'border-box'
-                  }}
-                >
-                  <option value="auto">Авто (системное время ТВ/устройства)</option>
-                  <option value="3">UTC+3 — Москва, Санкт-Петербург, Минск (MSK)</option>
-                  <option value="2">UTC+2 — Калининград</option>
-                  <option value="4">UTC+4 — Самара, Ижевск</option>
-                  <option value="5">UTC+5 — Екатеринбург, Уфа, Тюмень</option>
-                  <option value="6">UTC+6 — Омск</option>
-                  <option value="7">UTC+7 — Красноярск, Новосибирск</option>
-                  <option value="8">UTC+8 — Иркутск</option>
-                  <option value="9">UTC+9 — Якутск</option>
-                  <option value="10">UTC+10 — Владивосток</option>
-                </select>
-                <p style={{ fontSize: '11px', color: '#64748b', margin: '4px 0 0 0' }}>
-                  Для большинства каналов TV.Team выберите UTC+3 (Москва), если часы ТВ сбиты
-                </p>
-              </div>
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', marginTop: '12px' }}>
-                <button
-                  type="button"
-                  onClick={() => setOverlayMode('channels')}
-                  style={{
-                    padding: '10px 18px',
-                    borderRadius: '10px',
-                    backgroundColor: '#1e293b',
-                    color: '#cbd5e1',
-                    border: '1px solid rgba(51, 65, 85, 0.8)',
-                    cursor: 'pointer',
-                    fontSize: '13px'
-                  }}
-                >
-                  Отмена (BACK)
-                </button>
-                <button
-                  type="submit"
-                  disabled={isSavingSettings}
-                  style={{
-                    padding: '10px 20px',
-                    borderRadius: '10px',
-                    backgroundColor: '#0284c7',
-                    color: '#ffffff',
-                    fontWeight: 'bold',
-                    border: 'none',
-                    cursor: 'pointer',
-                    fontSize: '13px',
-                    boxShadow: '0 4px 15px rgba(2, 132, 199, 0.4)'
-                  }}
-                >
-                  {isSavingSettings ? 'Сохранение...' : '💾 Сохранить и загрузить'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

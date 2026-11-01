@@ -4,6 +4,7 @@ import { INITIAL_DEFAULT_PLAYLIST } from './data/presets';
 import { Header } from './components/Header';
 import { Builder } from './components/Builder';
 import { IptvPlayer } from './components/IptvPlayer';
+import { IptvSettingsTab } from './components/IptvSettingsTab';
 import {
   Copy,
   Check,
@@ -194,8 +195,6 @@ export default function App() {
       <Header
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        tvAddress={tvAddress}
-        serverUrl={serverUrl}
       />
 
       {/* Main Container */}
@@ -310,6 +309,10 @@ export default function App() {
             onEnterTvMode={() => setIsTvFullscreen(true)}
             onBackToMenu={() => setActiveTab('builder')}
           />
+        )}
+
+        {activeTab === 'iptv-settings' && (
+          <IptvSettingsTab onGoToPlayer={() => setActiveTab('iptv')} />
         )}
 
         {activeTab === 'builder' && (
