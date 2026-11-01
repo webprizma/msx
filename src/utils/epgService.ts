@@ -567,3 +567,56 @@ export function getChannelEpg(tvgId?: string, channelName?: string, tvgName?: st
 
   return [];
 }
+
+/**
+ * Returns the currently broadcasting live program title for a given channel, or null if not found.
+ */
+export function getLiveProgramTitle(tvgId?: string, channelName?: string, tvgName?: string): string | null {
+  const programs = getChannelEpg(tvgId, channelName, tvgName);
+  if (!programs || programs.length === 0) return null;
+
+  const now = Date.now();
+  // 1. Direct match: now is between start and end
+  const current = programs.find(p => p.start <= now && p.end > now);
+  if (current && current.title) return current.title;
+
+  // 2. Tolerance match: program within 15 minutes of now
+  const close = programs.find(p => p.start <= now + 15 * 60000 && p.end >= now - 15 * 60000);
+  if (close && close.title) return close.title;
+
+  return null;
+}
+
+// In-memory cache for batch live programs with 30s TTL
+let cachedBatchLive: { timestamp: number; data: Record<string, string> } | null = null;
+
+/**
+ * Fast batch resolution of currently airing live program titles for all provided channels.
+ */
+export function getBatchLivePrograms(
+  channels: Array<{ id: string; tvgId?: string; tvgName?: string; name: string }>
+): Record<string, string> {
+  const now = Date.now();
+  if (cachedBatchLive && now - cachedBatchLive.timestamp < 30000 && Object.keys(cachedBatchLive.data).length > 0) {
+    return cachedBatchLive.data;
+  }
+
+  const result: Record<string, string> = {};
+  if (!channels || channels.length === 0) return result;
+
+  for (const ch of channels) {
+    const title = getLiveProgramTitle(ch.tvgId, ch.name, ch.tvgName);
+    if (title) {
+      result[ch.id] = title;
+      result[ch.name] = title;
+      if (ch.tvgId) result[ch.tvgId] = title;
+    }
+  }
+
+  cachedBatchLive = {
+    timestamp: now,
+    data: result
+  };
+
+  return result;
+}

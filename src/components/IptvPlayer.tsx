@@ -131,6 +131,20 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [isLoadingStream, setIsLoadingStream] = useState(false);
 
+  // Stream stall detection & auto-recovery state
+  const [isStalled, setIsStalled] = useState(false);
+  const [stallReason, setStallReason] = useState<'buffering' | 'offline' | 'reconnecting'>('buffering');
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
+
+  // Live programs mapping across all channels (channelId / channelName -> programTitle)
+  const [liveProgramsMap, setLiveProgramsMap] = useState<Record<string, string>>({});
+
+  // Archive playback absolute timestamp tracking
+  const archiveBaseTimestampRef = useRef<number>(0);
+  const currentArchivePlaybackTimeRef = useRef<number>(0);
+  const lastVideoCurrentTimeRef = useRef<number>(-1);
+  const lastTimeUpdateRef = useRef<number>(Date.now());
+
   // Timeshift Seek state (Unix ms timestamp)
   const [seekTimestamp, setSeekTimestamp] = useState<number>(Date.now());
   const [activeTimelineProgram, setActiveTimelineProgram] = useState<EpgProgram | null>(null);
@@ -213,6 +227,25 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       setEpgReloadKey(prev => prev + 1);
     }
   }, [selectedChannel, settings.epgUrl, showToast]);
+
+  // Load and refresh currently airing live programs for all channels
+  const refreshLivePrograms = useCallback(async () => {
+    try {
+      const res = await fetch('/api/iptv/epg/live');
+      if (res.ok) {
+        const data = await res.json();
+        if (data && typeof data === 'object') {
+          setLiveProgramsMap(data);
+        }
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    refreshLivePrograms();
+    const interval = setInterval(refreshLivePrograms, 45000);
+    return () => clearInterval(interval);
+  }, [refreshLivePrograms, epgReloadKey]);
 
   // Format helpers with Moscow Timezone (Europe/Moscow, UTC+3) as standard for Russian IPTV/EPG
   const formatTime = useCallback((ms: number) => {
@@ -647,10 +680,28 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }
   }, [overlayMode, selectedDayOffset, selectedChannel?.id, filteredEpg.length, alignEpgList]);
 
+  // Get accurate current wall-clock playback timestamp (especially during archive playback)
+  const getCurrentPlaybackTimestamp = useCallback((): number => {
+    if (isArchiveMode) {
+      const v = videoRef.current;
+      const base = archiveBaseTimestampRef.current;
+      if (base > 0 && v && !isNaN(v.currentTime) && v.currentTime > 0) {
+        return base + Math.floor(v.currentTime * 1000);
+      }
+      if (currentArchivePlaybackTimeRef.current > 0) {
+        return currentArchivePlaybackTimeRef.current;
+      }
+      return seekTimestamp;
+    }
+    return Date.now();
+  }, [isArchiveMode, seekTimestamp]);
+
   // Stream Playback Handler with HLS.js
   const playStream = useCallback((streamUrl: string) => {
     setPlayerError(null);
     setIsLoadingStream(true);
+    setIsStalled(false);
+    lastTimeUpdateRef.current = Date.now();
 
     const video = videoRef.current;
     if (!video) return;
@@ -673,17 +724,26 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         setIsLoadingStream(false);
+        setIsStalled(false);
+        setReconnectAttempt(0);
         video.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
       });
 
       hls.on(Hls.Events.ERROR, (event, data) => {
+        if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR || data.details === Hls.ErrorDetails.BUFFER_NUDGE_ON_STALL) {
+          setIsStalled(true);
+          setStallReason(navigator.onLine ? 'buffering' : 'offline');
+        }
         if (data.fatal) {
           switch (data.type) {
             case Hls.ErrorTypes.NETWORK_ERROR:
-              setPlayerError('Ошибка загрузки потока провайдера. Проверьте активность подписки.');
+              setIsStalled(true);
+              setStallReason(navigator.onLine ? 'reconnecting' : 'offline');
+              setPlayerError(navigator.onLine ? 'Потеря соединения с сервером потока' : 'Отсутствует интернет-соединение');
               hls.startLoad();
               break;
             case Hls.ErrorTypes.MEDIA_ERROR:
+              setIsStalled(true);
               hls.recoverMediaError();
               break;
             default:
@@ -697,6 +757,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       video.src = streamUrl;
       video.addEventListener('loadedmetadata', () => {
         setIsLoadingStream(false);
+        setIsStalled(false);
+        setReconnectAttempt(0);
         video.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
       });
     } else {
@@ -705,23 +767,105 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }
   }, []);
 
-  // Play channel live stream on channel change
-  useEffect(() => {
-    if (selectedChannel && !isArchiveMode) {
-      playStream(selectedChannel.streamUrl);
-    }
-  }, [selectedChannel, isArchiveMode, playStream]);
-
   // Jump to Live Broadcast
   const handleJumpToLive = useCallback(() => {
     if (!selectedChannel) return;
     setIsArchiveMode(false);
+    archiveBaseTimestampRef.current = 0;
+    currentArchivePlaybackTimeRef.current = 0;
+    setIsStalled(false);
+    setReconnectAttempt(0);
     const liveProg = epgList.find(p => p.isLive) || epgList[0];
     setCurrentPlayingProgram(liveProg);
     setActiveTimelineProgram(liveProg);
     setSeekTimestamp(Date.now());
     playStream(selectedChannel.streamUrl);
   }, [selectedChannel, epgList, playStream]);
+
+  // Seamless Stream Recovery Watchdog (without full page reload)
+  const handleRecoverStream = useCallback((isManual = false) => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (!navigator.onLine) {
+      setStallReason('offline');
+      setIsStalled(true);
+      return;
+    }
+
+    setReconnectAttempt(prev => prev + 1);
+    setStallReason('reconnecting');
+    setIsStalled(true);
+    setPlayerError(null);
+
+    if (isArchiveMode) {
+      const currentTs = getCurrentPlaybackTimestamp();
+      if (!selectedChannel) return;
+      const matchedProgram = findProgramForTimestamp(epgList, currentTs);
+      const startSec = Math.floor(currentTs / 1000);
+      const endSec = matchedProgram ? Math.floor(matchedProgram.end / 1000) : startSec + 3600;
+      const archiveUrl = buildTimestampArchiveUrl(selectedChannel, startSec, endSec);
+      archiveBaseTimestampRef.current = currentTs;
+      currentArchivePlaybackTimeRef.current = currentTs;
+      setSeekTimestamp(currentTs);
+      playStream(archiveUrl);
+    } else if (selectedChannel) {
+      if (hlsRef.current) {
+        try {
+          hlsRef.current.recoverMediaError();
+          hlsRef.current.startLoad();
+          video.play().catch(() => {});
+        } catch {
+          playStream(selectedChannel.streamUrl);
+        }
+      } else {
+        playStream(selectedChannel.streamUrl);
+      }
+    }
+  }, [isArchiveMode, getCurrentPlaybackTimestamp, selectedChannel, epgList, playStream]);
+
+  // Watchdog effect: automatically detects stream stalls and seamlessly reconnects
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const video = videoRef.current;
+      if (!video) return;
+
+      // Ignore when user is deliberately paused, video ended, or stream is initially loading
+      if (isLoadingStream || !!playerError || video.paused || video.ended) {
+        return;
+      }
+
+      if (!navigator.onLine) {
+        setIsStalled(true);
+        setStallReason('offline');
+        return;
+      }
+
+      const elapsed = Date.now() - lastTimeUpdateRef.current;
+      if (elapsed >= 3500) {
+        setIsStalled(true);
+        setStallReason(prev => (prev === 'reconnecting' ? 'reconnecting' : 'buffering'));
+
+        // If frozen for 5.5s, trigger seamless auto-recovery
+        if (elapsed >= 5500) {
+          lastTimeUpdateRef.current = Date.now();
+          handleRecoverStream(false);
+        }
+      } else if (elapsed < 2000 && isStalled) {
+        setIsStalled(false);
+        setReconnectAttempt(0);
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isLoadingStream, playerError, isStalled, handleRecoverStream]);
+
+  // Play channel live stream on channel change
+  useEffect(() => {
+    if (selectedChannel && !isArchiveMode) {
+      playStream(selectedChannel.streamUrl);
+    }
+  }, [selectedChannel, isArchiveMode, playStream]);
 
   // Play Archive from a specific program
   const handlePlayArchiveProgram = useCallback((program: EpgProgram, fromStart = true) => {
@@ -739,12 +883,17 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     const archiveUrl = buildTimestampArchiveUrl(selectedChannel, startSec, endSec);
 
     setIsArchiveMode(true);
+    const baseTs = fromStart ? program.start : now;
+    archiveBaseTimestampRef.current = baseTs;
+    currentArchivePlaybackTimeRef.current = baseTs;
     setCurrentPlayingProgram(program);
     setActiveTimelineProgram(program);
-    setSeekTimestamp(fromStart ? program.start : Date.now());
+    setSeekTimestamp(baseTs);
+    setIsStalled(false);
+    setReconnectAttempt(0);
     playStream(archiveUrl);
     setOverlayMode('none');
-  }, [selectedChannel, playStream]);
+  }, [selectedChannel, playStream, showToast]);
 
   // Play Archive from an exact seek timestamp
   const handleSeekToTimestamp = useCallback((targetTimestamp: number) => {
@@ -762,11 +911,15 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
 
     const archiveUrl = buildTimestampArchiveUrl(selectedChannel, startSec, endSec);
     setIsArchiveMode(true);
+    archiveBaseTimestampRef.current = targetTimestamp;
+    currentArchivePlaybackTimeRef.current = targetTimestamp;
     if (matchedProgram) {
       setCurrentPlayingProgram(matchedProgram);
       setActiveTimelineProgram(matchedProgram);
     }
     setSeekTimestamp(targetTimestamp);
+    setIsStalled(false);
+    setReconnectAttempt(0);
     playStream(archiveUrl);
   }, [selectedChannel, epgList, handleJumpToLive, playStream]);
 
@@ -919,6 +1072,10 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       if (overlayMode === 'none') {
         switch (action) {
           case 'OK':
+            if (isStalled) {
+              handleRecoverStream(true);
+              break;
+            }
           case 'UP':
             if (selectedChannel) {
               const grp = selectedChannel.group || 'Все';
@@ -931,43 +1088,73 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             break;
 
           case 'DOWN':
-            setOverlayMode('timeline');
-            setSeekTimestamp(isArchiveMode ? seekTimestamp : Date.now());
-            setActiveTimelineProgram(currentPlayingProgram);
-            resetTimelineAutoHide();
+            {
+              const currentPos = getCurrentPlaybackTimestamp();
+              setSeekTimestamp(currentPos);
+              const matched = findProgramForTimestamp(epgList, currentPos);
+              if (matched) setActiveTimelineProgram(matched);
+              setOverlayMode('timeline');
+              resetTimelineAutoHide();
+            }
             break;
 
           case 'LEFT':
           case 'REWIND':
-            handleSeekToTimestamp(seekTimestamp - 60000);
-            setOverlayMode('timeline');
-            resetTimelineAutoHide();
+            {
+              const currentPos = getCurrentPlaybackTimestamp();
+              const targetTime = currentPos - 60000;
+              handleSeekToTimestamp(targetTime);
+              setOverlayMode('timeline');
+              resetTimelineAutoHide();
+            }
             break;
 
           case 'RIGHT':
           case 'FAST_FORWARD':
-            handleSeekToTimestamp(Math.min(Date.now(), seekTimestamp + 60000));
-            setOverlayMode('timeline');
-            resetTimelineAutoHide();
+            {
+              const now = Date.now();
+              const currentPos = getCurrentPlaybackTimestamp();
+              const targetTime = Math.min(now, currentPos + 60000);
+              handleSeekToTimestamp(targetTime);
+              setOverlayMode('timeline');
+              resetTimelineAutoHide();
+            }
             break;
 
           case 'CHANNEL_UP':
             if (filteredChannels.length > 0 && selectedChannel) {
               const idx = filteredChannels.findIndex(c => c.id === selectedChannel.id);
-              if (idx > 0) setSelectedChannel(filteredChannels[idx - 1]);
+              if (idx > 0) {
+                const prevCh = filteredChannels[idx - 1];
+                setIsArchiveMode(false);
+                archiveBaseTimestampRef.current = 0;
+                currentArchivePlaybackTimeRef.current = 0;
+                setIsStalled(false);
+                setReconnectAttempt(0);
+                setSelectedChannel(prevCh);
+                playStream(prevCh.streamUrl);
+              }
             }
             break;
 
           case 'CHANNEL_DOWN':
             if (filteredChannels.length > 0 && selectedChannel) {
               const idx = filteredChannels.findIndex(c => c.id === selectedChannel.id);
-              if (idx < filteredChannels.length - 1) setSelectedChannel(filteredChannels[idx + 1]);
+              if (idx < filteredChannels.length - 1) {
+                const nextCh = filteredChannels[idx + 1];
+                setIsArchiveMode(false);
+                archiveBaseTimestampRef.current = 0;
+                currentArchivePlaybackTimeRef.current = 0;
+                setIsStalled(false);
+                setReconnectAttempt(0);
+                setSelectedChannel(nextCh);
+                playStream(nextCh.streamUrl);
+              }
             }
             break;
 
           case 'BACK':
-            // CRITICAL FIX: DO NOT exit to black screen when watching TV!
-            // Just display the bottom hint briefly to confirm TV is active.
+            // DO NOT exit to black screen when watching TV!
             pokeBottomHint();
             break;
         }
@@ -1010,8 +1197,15 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           case 'OK':
             if (filteredChannels[focusedChannelIndex]) {
               const ch = filteredChannels[focusedChannelIndex];
+              setIsArchiveMode(false);
+              archiveBaseTimestampRef.current = 0;
+              currentArchivePlaybackTimeRef.current = 0;
+              setIsStalled(false);
+              setReconnectAttempt(0);
+              setPlayerError(null);
               setSelectedChannel(ch);
               setSelectedDayOffset(0);
+              playStream(ch.streamUrl);
               setOverlayMode('epg');
             }
             break;
@@ -1055,6 +1249,11 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           case 'OK':
             if (filteredEpg.length === 0) {
               handleForceReloadEpg();
+              if (selectedChannel) {
+                setIsArchiveMode(false);
+                archiveBaseTimestampRef.current = 0;
+                playStream(selectedChannel.streamUrl);
+              }
               break;
             }
             if (filteredEpg[focusedProgramIndex]) {
@@ -1250,6 +1449,39 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           style={{ width: '100%', height: '100%', objectFit: 'contain' }}
           autoPlay
           playsInline
+          onTimeUpdate={() => {
+            const v = videoRef.current;
+            if (!v) return;
+            const cur = v.currentTime;
+            const now = Date.now();
+            if (cur !== lastVideoCurrentTimeRef.current) {
+              lastVideoCurrentTimeRef.current = cur;
+              lastTimeUpdateRef.current = now;
+              if (isStalled) {
+                setIsStalled(false);
+                setReconnectAttempt(0);
+              }
+            }
+            if (isArchiveMode && archiveBaseTimestampRef.current > 0) {
+              const currentTimestamp = archiveBaseTimestampRef.current + Math.floor(cur * 1000);
+              currentArchivePlaybackTimeRef.current = currentTimestamp;
+            }
+          }}
+          onPlaying={() => {
+            setIsPlaying(true);
+            setIsStalled(false);
+            setReconnectAttempt(0);
+            setIsLoadingStream(false);
+            setPlayerError(null);
+            lastTimeUpdateRef.current = Date.now();
+          }}
+          onWaiting={() => {
+            lastTimeUpdateRef.current = Date.now();
+          }}
+          onStalled={() => {
+            setIsStalled(true);
+            setStallReason(navigator.onLine ? 'buffering' : 'offline');
+          }}
         />
 
         {/* Loading Spinner */}
@@ -1281,6 +1513,70 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             <p style={{ fontSize: '15px', fontWeight: 'bold', color: '#bae6fd' }}>
               Загрузка {selectedChannel?.name ? `(${selectedChannel.name})` : ''}...
             </p>
+          </div>
+        )}
+
+        {/* Stream Stall Watchdog & Auto-Recovery Overlay */}
+        {isStalled && !isLoadingStream && (
+          <div
+            style={{
+              position: 'absolute',
+              top: '40px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              backgroundColor: 'rgba(15, 23, 42, 0.95)',
+              border: `2px solid ${stallReason === 'offline' ? '#ef4444' : '#f59e0b'}`,
+              boxShadow: '0 8px 30px rgba(0, 0, 0, 0.85)',
+              borderRadius: '16px',
+              padding: '12px 24px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '14px',
+              zIndex: 35,
+              maxWidth: '85vw'
+            }}
+          >
+            <div
+              style={{
+                width: '20px',
+                height: '20px',
+                borderRadius: '50%',
+                border: `3px solid ${stallReason === 'offline' ? 'rgba(239, 68, 68, 0.3)' : 'rgba(245, 158, 11, 0.3)'}`,
+                borderTopColor: stallReason === 'offline' ? '#ef4444' : '#f59e0b',
+                animation: 'spin 1s linear infinite',
+                flexShrink: 0
+              }}
+            />
+            <div>
+              <p style={{ margin: 0, fontSize: '14px', fontWeight: 'bold', color: '#ffffff' }}>
+                {stallReason === 'offline'
+                  ? 'Отсутствует подключение к интернету'
+                  : stallReason === 'reconnecting'
+                  ? `Повторный запрос к потоку (попытка ${reconnectAttempt})...`
+                  : 'Поток приостановлен (буферизация)...'}
+              </p>
+              <p style={{ margin: '2px 0 0 0', fontSize: '12px', color: '#94a3b8' }}>
+                {stallReason === 'offline'
+                  ? 'Проверьте сетевое подключение Wi-Fi или LAN-кабель'
+                  : 'Автоматический повторный запрос без перезагрузки экрана'}
+              </p>
+            </div>
+            <button
+              onClick={() => handleRecoverStream(true)}
+              style={{
+                marginLeft: '8px',
+                padding: '6px 14px',
+                backgroundColor: 'rgba(56, 189, 248, 0.2)',
+                border: '1px solid #38bdf8',
+                borderRadius: '8px',
+                color: '#38bdf8',
+                fontSize: '12px',
+                fontWeight: 'bold',
+                cursor: 'pointer'
+              }}
+            >
+              Повторить (OK)
+            </button>
           </div>
         )}
 
@@ -1504,7 +1800,14 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                     key={channel.id || actualIndex}
                     id={`ch-item-${actualIndex}`}
                     onClick={() => {
+                      setIsArchiveMode(false);
+                      archiveBaseTimestampRef.current = 0;
+                      currentArchivePlaybackTimeRef.current = 0;
+                      setIsStalled(false);
+                      setReconnectAttempt(0);
+                      setPlayerError(null);
                       setSelectedChannel(channel);
+                      playStream(channel.streamUrl);
                       setFocusedChannelIndex(actualIndex);
                       setSelectedDayOffset(0);
                       setOverlayMode('epg');
@@ -1572,9 +1875,25 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                       <p style={{ fontSize: '13px', fontWeight: 'bold', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {channel.name}
                       </p>
-                      <p style={{ fontSize: '11px', color: isFocused ? '#bae6fd' : '#94a3b8', margin: '2px 0 0 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {channel.group || 'Общие'}
-                      </p>
+                      {liveProgramsMap[channel.id] || liveProgramsMap[channel.name] || (channel.tvgId && liveProgramsMap[channel.tvgId]) || channel.currentProgram ? (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '5px', margin: '2px 0 0 0' }}>
+                          <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#22c55e', flexShrink: 0 }} />
+                          <p style={{
+                            fontSize: '11px',
+                            color: isFocused ? '#bae6fd' : '#cbd5e1',
+                            margin: 0,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap'
+                          }}>
+                            {liveProgramsMap[channel.id] || liveProgramsMap[channel.name] || (channel.tvgId && liveProgramsMap[channel.tvgId]) || channel.currentProgram}
+                          </p>
+                        </div>
+                      ) : (
+                        <p style={{ fontSize: '11px', color: isFocused ? '#bae6fd' : '#94a3b8', margin: '2px 0 0 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {channel.group || 'Общие'}
+                        </p>
+                      )}
                     </div>
 
                     <span

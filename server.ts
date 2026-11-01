@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { initEpgCache, syncEpg, getChannelEpg, getEpgSyncStatus } from './src/utils/epgService.ts';
+import { initEpgCache, syncEpg, getChannelEpg, getEpgSyncStatus, getBatchLivePrograms } from './src/utils/epgService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -395,6 +395,18 @@ app.post('/api/iptv/epg/sync', async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// Live program titles for channels (fast dictionary lookup)
+app.get('/api/iptv/epg/live', (req, res) => {
+  const liveMap = getBatchLivePrograms(cachedChannels);
+  res.json(liveMap);
+});
+
+app.post('/api/iptv/epg/live', (req, res) => {
+  const requestedChannels = req.body?.channels || cachedChannels;
+  const liveMap = getBatchLivePrograms(requestedChannels);
+  res.json(liveMap);
 });
 
 // In-memory and disk cache for IPTV channels

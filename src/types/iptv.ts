@@ -9,6 +9,7 @@ export interface Channel {
   catchupDays: number;
   catchupSource?: string;
   catchupType?: string;
+  currentProgram?: string;
 }
 
 export interface EpgProgram {
