@@ -2,12 +2,23 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { initEpgCache, syncEpg, getChannelEpg, getEpgSyncStatus, getBatchLivePrograms } from './src/utils/epgService.ts';
+import {
+  initEpgCache,
+  syncEpg,
+  getChannelEpg,
+  getEpgSyncStatus,
+  getBatchLivePrograms,
+  isCacheFresh,
+  linkChannelNamesFromPlaylist,
+  EPG_CACHE_TTL_MS
+} from './src/utils/epgService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_FILE = path.resolve(__dirname, 'msx-data.json');
 const IPTV_SETTINGS_FILE = path.resolve(__dirname, 'iptv-settings.json');
+const PLAYLIST_CACHE_FILE = path.join(path.resolve(__dirname, 'iptv-cache'), 'playlist-channels.json');
+const PLAYLIST_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const app = express();
 const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
@@ -32,11 +43,35 @@ if (!iptvSettings.epgUrl || iptvSettings.epgUrl.includes('1.1.xml')) {
   iptvSettings.epgUrl = 'https://rus.epg.team/7.1.xml?pkg=442';
 }
 
-// Initialize disk-cached EPG & trigger background sync
+// In-memory and disk cache for IPTV channels (24-hour TTL)
+let cachedChannels: any[] = [];
+let lastPlaylistFetchTime = 0;
+
+try {
+  if (fs.existsSync(PLAYLIST_CACHE_FILE)) {
+    const stat = fs.statSync(PLAYLIST_CACHE_FILE);
+    cachedChannels = JSON.parse(fs.readFileSync(PLAYLIST_CACHE_FILE, 'utf8'));
+    lastPlaylistFetchTime = stat.mtimeMs || Date.now();
+    console.log(`[IPTV Server] Loaded ${cachedChannels.length} channels from disk cache (mtime: ${new Date(lastPlaylistFetchTime).toISOString()}).`);
+  }
+} catch (e) {}
+
+// Initialize disk-cached EPG & pre-index channels for sub-millisecond TV lookups
 initEpgCache();
-syncEpg(iptvSettings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442').catch(err => {
-  console.warn('[EPG Background Sync Notice]:', err?.message || err);
-});
+if (cachedChannels.length > 0) {
+  linkChannelNamesFromPlaylist(cachedChannels);
+}
+
+// 24-HOUR EPG CHECK: Only query the internet if cache is missing or older than 24h
+if (!isCacheFresh()) {
+  console.log('[IPTV Server] EPG cache is older than 24h or missing. Starting background sync...');
+  syncEpg(iptvSettings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442').catch(err => {
+    console.warn('[EPG Background Sync Notice]:', err?.message || err);
+  });
+} else {
+  const status = getEpgSyncStatus();
+  console.log(`[IPTV Server] 24-Hour EPG Cache is active (${status.totalProgrammes} progs across ${status.channelsCount} channels, age: ${status.cacheAgeHours}h). Internet download skipped.`);
+}
 
 // In-memory default MSX playlist state
 let currentMsxPlaylist: any = {
@@ -369,23 +404,14 @@ function cleanCategory(raw: string): string {
   return clean || 'Общие';
 }
 
-// Real EPG endpoint for TV channels
+// Real EPG endpoint for TV channels (Sub-millisecond in-memory response)
 app.get('/api/iptv/epg', (req, res) => {
   const channelId = (req.query.channelId as string) || (req.query.tvgId as string) || '';
   const name = (req.query.name as string) || '';
   const tvgName = (req.query.tvgName as string) || '';
-  const force = req.query.force === 'true';
 
-  let programs = getChannelEpg(channelId, name, tvgName);
-
-  // If forced reload and still 0 programs, trigger background sync if not already syncing
-  if (force && programs.length === 0) {
-    const status = getEpgSyncStatus();
-    if (!status.isSyncing) {
-      syncEpg(iptvSettings.epgUrl).catch(e => console.warn('[EPG Force Sync]', e));
-    }
-  }
-
+  // Instant in-memory lookup (< 1 ms), never blocks or triggers network downloads
+  const programs = getChannelEpg(channelId, name, tvgName);
   res.json(programs);
 });
 
@@ -394,11 +420,27 @@ app.get('/api/iptv/epg/status', (req, res) => {
   res.json(getEpgSyncStatus());
 });
 
-// Trigger manual EPG sync (starts in background and returns immediate response to prevent client timeouts)
+// Trigger manual EPG sync (strictly follows 24-hour cache rule unless force: true is sent)
 app.post('/api/iptv/epg/sync', async (req, res) => {
   const targetEpgUrl = req.body?.epgUrl || iptvSettings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442';
+  const force = req.body?.force === true;
+
   try {
     const status = getEpgSyncStatus();
+
+    // 24-HOUR RULE: If cache is fresh, answer from cache without hitting internet
+    if (!force && status.isFresh) {
+      return res.json({
+        success: true,
+        started: false,
+        fromCache: true,
+        isSyncing: false,
+        message: `Использован суточный кеш (возраст: ${status.cacheAgeHours}ч). Данные обновляются раз в сутки.`,
+        channelsCount: status.channelsCount,
+        totalProgrammes: status.totalProgrammes
+      });
+    }
+
     if (status.isSyncing) {
       return res.json({
         success: true,
@@ -411,7 +453,7 @@ app.post('/api/iptv/epg/sync', async (req, res) => {
     }
 
     // Launch background task
-    syncEpg(targetEpgUrl).catch(e => console.error('[Background EPG Sync Notice]:', e?.message || e));
+    syncEpg(targetEpgUrl, force).catch(e => console.error('[Background EPG Sync Notice]:', e?.message || e));
 
     res.json({
       success: true,
@@ -438,21 +480,11 @@ app.post('/api/iptv/epg/live', (req, res) => {
   res.json(liveMap);
 });
 
-// In-memory and disk cache for IPTV channels
-const PLAYLIST_CACHE_FILE = path.join(path.resolve(__dirname, 'iptv-cache'), 'playlist-channels.json');
-let cachedChannels: any[] = [];
-let lastPlaylistFetchTime = 0;
-
-try {
-  if (fs.existsSync(PLAYLIST_CACHE_FILE)) {
-    cachedChannels = JSON.parse(fs.readFileSync(PLAYLIST_CACHE_FILE, 'utf8'));
-    console.log(`[IPTV Server] Loaded ${cachedChannels.length} channels from disk cache.`);
-  }
-} catch (e) {}
-
 async function fetchAndCacheChannels(targetUrl: string, force = false): Promise<any[]> {
   if (!targetUrl) return cachedChannels;
-  if (!force && cachedChannels.length > 0 && Date.now() - lastPlaylistFetchTime < 600000) {
+
+  // 24-HOUR PLAYLIST RULE: Do not hit internet if cache is younger than 24 hours
+  if (!force && cachedChannels.length > 0 && Date.now() - lastPlaylistFetchTime < PLAYLIST_CACHE_TTL_MS) {
     return cachedChannels;
   }
 
@@ -511,6 +543,7 @@ async function fetchAndCacheChannels(targetUrl: string, force = false): Promise<
           lastPlaylistFetchTime = Date.now();
           console.log(`[IPTV Server] Successfully parsed and cached ${channels.length} channels from playlist!`);
           fs.promises.writeFile(PLAYLIST_CACHE_FILE, JSON.stringify(channels), 'utf8').catch(() => {});
+          linkChannelNamesFromPlaylist(channels);
           return channels;
         }
       }
@@ -522,28 +555,20 @@ async function fetchAndCacheChannels(targetUrl: string, force = false): Promise<
   return cachedChannels;
 }
 
-// Trigger initial playlist fetch on server boot
-if (iptvSettings.playlistUrl) {
+// Initial playlist check on server boot (24-hour guard)
+if (iptvSettings.playlistUrl && (cachedChannels.length === 0 || Date.now() - lastPlaylistFetchTime >= PLAYLIST_CACHE_TTL_MS)) {
   fetchAndCacheChannels(iptvSettings.playlistUrl).catch(() => {});
 }
 
 app.get('/api/iptv/channels', async (req, res) => {
   const targetUrl = (req.query.url as string) || iptvSettings.playlistUrl;
-  if (!targetUrl && cachedChannels.length > 0) {
+
+  // Instant response if channels are already in cache (< 24 hours)
+  if (cachedChannels.length > 0 && Date.now() - lastPlaylistFetchTime < PLAYLIST_CACHE_TTL_MS) {
     return res.json(cachedChannels);
   }
 
-  // Instant response if channels are already in cache
-  if (cachedChannels.length > 0 && (!req.query.url || req.query.url === iptvSettings.playlistUrl)) {
-    res.json(cachedChannels);
-    // Background refresh if older than 10 minutes
-    if (Date.now() - lastPlaylistFetchTime > 600000) {
-      fetchAndCacheChannels(targetUrl).catch(() => {});
-    }
-    return;
-  }
-
-  const channels = await fetchAndCacheChannels(targetUrl, true);
+  const channels = await fetchAndCacheChannels(targetUrl);
   res.json(channels);
 });
 

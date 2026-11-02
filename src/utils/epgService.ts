@@ -27,12 +27,48 @@ let lastSyncTime = 0;
 let totalProgrammesCount = 0;
 let currentMirrorSource = EPG_MIRROR_SOURCES[0];
 
+export const EPG_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+export function isCacheFresh(): boolean {
+  return programsByChannel.size > 0 && totalProgrammesCount > 0 && (Date.now() - lastSyncTime < EPG_CACHE_TTL_MS);
+}
+
+export function linkChannelNamesFromPlaylist(channels: any[]) {
+  if (!Array.isArray(channels)) return;
+  for (const ch of channels) {
+    const targetId = ch.tvgId || ch.id;
+    if (!targetId) continue;
+    if (ch.id) {
+      channelAliases.set(ch.id, targetId);
+      channelAliases.set(normalizeName(ch.id), targetId);
+    }
+    if (ch.tvgId) {
+      channelAliases.set(ch.tvgId, ch.tvgId);
+      channelAliases.set(normalizeName(ch.tvgId), ch.tvgId);
+    }
+    if (ch.name) {
+      channelAliases.set(normalizeName(ch.name), targetId);
+      const stripped = stripSuffixes(ch.name);
+      if (stripped) channelAliases.set(normalizeName(stripped), targetId);
+    }
+    if (ch.tvgName) {
+      channelAliases.set(normalizeName(ch.tvgName), targetId);
+      const stripped = stripSuffixes(ch.tvgName);
+      if (stripped) channelAliases.set(normalizeName(stripped), targetId);
+    }
+  }
+  console.log(`[EPG Service] Pre-indexed ${channels.length} channels from playlist into memory. Total fast aliases: ${channelAliases.size}`);
+}
+
 export function getEpgSyncStatus() {
+  const ageHours = lastSyncTime > 0 ? ((Date.now() - lastSyncTime) / 3600000).toFixed(1) : '0';
   return {
     isSyncing,
     channelsCount: programsByChannel.size,
     totalProgrammes: totalProgrammesCount,
     lastSyncTime,
+    cacheAgeHours: ageHours,
+    isFresh: isCacheFresh(),
     currentMirror: currentMirrorSource,
     mirrorsAvailable: EPG_MIRROR_SOURCES.length
   };
@@ -351,6 +387,9 @@ async function parseEpgFromStream(url: string): Promise<{ channelCount: number; 
       totalProgrammes++;
     }
 
+    // Yield to Node.js event loop so incoming TV requests are processed without any delay
+    await new Promise(resolve => setImmediate(resolve));
+
     // Progressively merge early channels into main memory so they become immediately queryable
     if (Date.now() - lastFlushTime > 1500) {
       for (const [chId, list] of tempMap.entries()) {
@@ -388,7 +427,20 @@ async function parseEpgFromStream(url: string): Promise<{ channelCount: number; 
  * Resilient multi-mirror EPG synchronization.
  * If the primary URL fails or provides no programs, it automatically fails over to backup mirrors.
  */
-export async function syncEpg(customUrl?: string): Promise<{ success: boolean; channelsCount: number; message: string; mirror: string }> {
+export async function syncEpg(customUrl?: string, force = false): Promise<{ success: boolean; channelsCount: number; message: string; mirror: string; fromCache?: boolean }> {
+  // 24-HOUR CACHE RULE: Never re-download if cache is fresh (< 24 hours)
+  if (!force && isCacheFresh()) {
+    const ageHours = ((Date.now() - lastSyncTime) / 3600000).toFixed(1);
+    console.log(`[EPG Service] 24-Hour Cache Active: age is ${ageHours}h, ${totalProgrammesCount} progs across ${programsByChannel.size} channels. Internet download skipped.`);
+    return {
+      success: true,
+      channelsCount: programsByChannel.size,
+      message: `Использован локальный суточный кеш (${totalProgrammesCount} передач для ${programsByChannel.size} каналов)`,
+      mirror: 'local-24h-cache',
+      fromCache: true
+    };
+  }
+
   if (isSyncing) {
     return {
       success: false,
@@ -467,34 +519,27 @@ export async function syncEpg(customUrl?: string): Promise<{ success: boolean; c
   }
 }
 
-// Helper to return deduplicated program list
-function resolveAndDedupe(list?: EpgProgram[]): EpgProgram[] {
-  if (!list || list.length === 0) return [];
-  return deduplicateEpg(list);
-}
-
 /**
  * Ultra-smart channel lookup supporting:
  * - Direct tvgId (ch001, ch1, 1, 442_01, etc.)
  * - Direct channelName & tvgName
  * - Normalized names & stripped suffixes (HD, FHD, UHD, 4K, HDR, 50fps)
- * - Channel aliases extracted from all <display-name> tags
+ * - Channel aliases extracted from all <display-name> tags and playlist
  */
 export function getChannelEpg(tvgId?: string, channelName?: string, tvgName?: string): EpgProgram[] {
   // 1. Direct match by tvgId
   if (tvgId) {
     if (programsByChannel.has(tvgId)) {
-      return resolveAndDedupe(programsByChannel.get(tvgId));
+      return programsByChannel.get(tvgId)!;
     }
     const lowerId = tvgId.toLowerCase();
     if (programsByChannel.has(lowerId)) {
-      return resolveAndDedupe(programsByChannel.get(lowerId));
+      return programsByChannel.get(lowerId)!;
     }
 
-    // Check alias by normalized tvgId
-    const aliasByTvgId = channelAliases.get(normalizeName(tvgId));
+    const aliasByTvgId = channelAliases.get(tvgId) || channelAliases.get(lowerId) || channelAliases.get(normalizeName(tvgId));
     if (aliasByTvgId && programsByChannel.has(aliasByTvgId)) {
-      return resolveAndDedupe(programsByChannel.get(aliasByTvgId));
+      return programsByChannel.get(aliasByTvgId)!;
     }
 
     // Numeric variations: ch001, ch01, ch1, 1
@@ -505,40 +550,40 @@ export function getChannelEpg(tvgId?: string, channelName?: string, tvgName?: st
       const padded2 = `ch${String(num).padStart(2, '0')}`;
       const unpadded = `ch${num}`;
       const bareNum = String(num);
-      if (programsByChannel.has(padded3)) return resolveAndDedupe(programsByChannel.get(padded3));
-      if (programsByChannel.has(padded2)) return resolveAndDedupe(programsByChannel.get(padded2));
-      if (programsByChannel.has(unpadded)) return resolveAndDedupe(programsByChannel.get(unpadded));
-      if (programsByChannel.has(bareNum)) return resolveAndDedupe(programsByChannel.get(bareNum));
+      if (programsByChannel.has(padded3)) return programsByChannel.get(padded3)!;
+      if (programsByChannel.has(padded2)) return programsByChannel.get(padded2)!;
+      if (programsByChannel.has(unpadded)) return programsByChannel.get(unpadded)!;
+      if (programsByChannel.has(bareNum)) return programsByChannel.get(bareNum)!;
     }
   }
 
   // 2. Direct match by tvgName
   if (tvgName) {
     if (programsByChannel.has(tvgName)) {
-      return resolveAndDedupe(programsByChannel.get(tvgName));
+      return programsByChannel.get(tvgName)!;
     }
     const normTvgName = normalizeName(tvgName);
-    const aliasId = channelAliases.get(normTvgName);
+    const aliasId = channelAliases.get(tvgName) || channelAliases.get(normTvgName);
     if (aliasId && programsByChannel.has(aliasId)) {
-      return resolveAndDedupe(programsByChannel.get(aliasId));
+      return programsByChannel.get(aliasId)!;
     }
     const strippedTvgName = normalizeName(stripSuffixes(tvgName));
     const strippedAliasId = channelAliases.get(strippedTvgName);
     if (strippedAliasId && programsByChannel.has(strippedAliasId)) {
-      return resolveAndDedupe(programsByChannel.get(strippedAliasId));
+      return programsByChannel.get(strippedAliasId)!;
     }
   }
 
   // 3. Match by channelName
   if (channelName) {
     if (programsByChannel.has(channelName)) {
-      return resolveAndDedupe(programsByChannel.get(channelName));
+      return programsByChannel.get(channelName)!;
     }
 
     const norm = normalizeName(channelName);
-    const mappedId = channelAliases.get(norm);
+    const mappedId = channelAliases.get(channelName) || channelAliases.get(norm);
     if (mappedId && programsByChannel.has(mappedId)) {
-      return resolveAndDedupe(programsByChannel.get(mappedId));
+      return programsByChannel.get(mappedId)!;
     }
 
     // Strip common suffixes (HD, FHD, UHD, HDR, 4K, Double, +2, +4, +6)
@@ -546,7 +591,7 @@ export function getChannelEpg(tvgId?: string, channelName?: string, tvgName?: st
     if (strippedNorm && strippedNorm !== norm) {
       const fallbackId = channelAliases.get(strippedNorm);
       if (fallbackId && programsByChannel.has(fallbackId)) {
-        return resolveAndDedupe(programsByChannel.get(fallbackId));
+        return programsByChannel.get(fallbackId)!;
       }
     }
 
@@ -559,7 +604,7 @@ export function getChannelEpg(tvgId?: string, channelName?: string, tvgName?: st
         (aliasNorm.length > 4 && norm.includes(aliasNorm))
       ) {
         if (programsByChannel.has(id)) {
-          return resolveAndDedupe(programsByChannel.get(id));
+          return programsByChannel.get(id)!;
         }
       }
     }

@@ -209,23 +209,14 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   // EPG forced reload trigger state
   const [epgReloadKey, setEpgReloadKey] = useState(0);
 
-  // Manual forced reload of EPG from mirror sources
-  const handleForceReloadEpg = useCallback(async () => {
+  // Manual reload of EPG from local server cache (instant 24h lookup)
+  const handleForceReloadEpg = useCallback(() => {
     if (!selectedChannel) return;
-    showToast('Принудительное обновление телегида...');
+    showToast('Проверка программы передач...');
     epgCache.current.delete(selectedChannel.id);
     setIsLoadingEpg(true);
-    setEpgList([]);
-    try {
-      await fetch('/api/iptv/epg/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ epgUrl: settings.epgUrl })
-      }).catch(() => {});
-    } finally {
-      setEpgReloadKey(prev => prev + 1);
-    }
-  }, [selectedChannel, settings.epgUrl, showToast]);
+    setEpgReloadKey(prev => prev + 1);
+  }, [selectedChannel, showToast]);
 
   // Load and refresh currently airing live programs for all channels
   const refreshLivePrograms = useCallback(async () => {
@@ -467,10 +458,10 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     const tvgId = selectedChannel.tvgId || '';
     const name = selectedChannel.name || '';
     const tvgName = selectedChannel.tvgName || '';
-    const forceParam = epgReloadKey > 0 ? '&force=true' : '';
+    const chId = selectedChannel.id || '';
 
-    const fetchEpg = (attempt = 1) => {
-      fetch(`/api/iptv/epg?channelId=${encodeURIComponent(tvgId)}&name=${encodeURIComponent(name)}&tvgName=${encodeURIComponent(tvgName)}${forceParam}`)
+    const fetchEpg = () => {
+      fetch(`/api/iptv/epg?channelId=${encodeURIComponent(tvgId || chId)}&name=${encodeURIComponent(name)}&tvgName=${encodeURIComponent(tvgName)}`)
         .then(res => (res.ok ? res.json() : []))
         .then((realPrograms: EpgProgram[]) => {
           if (isCancelled) return;
@@ -519,44 +510,24 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               }
             }
           } else {
-            // Check if server is still syncing EPG in background
-            fetch('/api/iptv/epg/status')
-              .then(res => (res.ok ? res.json() : null))
-              .then(status => {
-                if (isCancelled) return;
-                const isSyncing = status?.isSyncing ?? false;
-
-                if (isSyncing && attempt <= 20) {
-                  // Keep polling every 1.5s while server is downloading / parsing EPG
-                  retryTimer = setTimeout(() => {
-                    if (!isCancelled) fetchEpg(attempt + 1);
-                  }, 1500);
-                } else {
-                  // No EPG returned yet — keep list empty and show fallback live, do NOT lock cache
-                  setEpgList([]);
-                  const fallbackLive: EpgProgram = {
-                    id: `live-${selectedChannel.id}`,
-                    channelId: selectedChannel.id,
-                    title: selectedChannel.name,
-                    description: 'Прямой эфир телеканала',
-                    category: selectedChannel.group || 'ТВ',
-                    start: now - 3600000,
-                    end: now + 3600000,
-                    isLive: true,
-                    hasArchive: false
-                  };
-                  setCurrentPlayingProgram(fallbackLive);
-                  setActiveTimelineProgram(fallbackLive);
-                  setSeekTimestamp(now);
-                  setIsArchiveMode(false);
-                  setIsLoadingEpg(false);
-                }
-              })
-              .catch(() => {
-                if (isCancelled) return;
-                setEpgList([]);
-                setIsLoadingEpg(false);
-              });
+            // No EPG returned yet — keep list empty and show fallback live, do NOT lock cache
+            setEpgList([]);
+            const fallbackLive: EpgProgram = {
+              id: `live-${selectedChannel.id}`,
+              channelId: selectedChannel.id,
+              title: selectedChannel.name,
+              description: 'Прямой эфир телеканала',
+              category: selectedChannel.group || 'ТВ',
+              start: now - 3600000,
+              end: now + 3600000,
+              isLive: true,
+              hasArchive: false
+            };
+            setCurrentPlayingProgram(fallbackLive);
+            setActiveTimelineProgram(fallbackLive);
+            setSeekTimestamp(now);
+            setIsArchiveMode(false);
+            setIsLoadingEpg(false);
           }
         })
         .catch(() => {
@@ -566,11 +537,10 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         });
     };
 
-    fetchEpg(1);
+    fetchEpg();
 
     return () => {
       isCancelled = true;
-      if (retryTimer) clearTimeout(retryTimer);
     };
   }, [selectedChannel?.id, epgReloadKey]);
 
