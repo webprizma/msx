@@ -29,6 +29,14 @@ let currentMirrorSource = EPG_MIRROR_SOURCES[0];
 
 export const EPG_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+export function getProgramsByChannel(): Map<string, EpgProgram[]> {
+  return programsByChannel;
+}
+
+export function getChannelAliases(): Map<string, string> {
+  return channelAliases;
+}
+
 export function isCacheFresh(): boolean {
   return programsByChannel.size > 0 && totalProgrammesCount > 0 && (Date.now() - lastSyncTime < EPG_CACHE_TTL_MS);
 }
@@ -480,6 +488,17 @@ export async function syncEpg(customUrl?: string, force = false): Promise<{ succ
 
           // Persist durable cache
           await persistDurableCache();
+
+          // Atomically write into SQLite database
+          try {
+            const { atomicSaveToDb, getAllChannelsFromDb } = await import('../db/iptvDatabase.ts');
+            const channels = getAllChannelsFromDb();
+            if (channels.length > 0 && programsByChannel.size > 0) {
+              atomicSaveToDb(channels, programsByChannel, channelAliases);
+            }
+          } catch (dbErr) {
+            console.warn('[EPG Service] Notice updating SQLite DB:', dbErr);
+          }
 
           return {
             success: true,

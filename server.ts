@@ -10,8 +10,19 @@ import {
   getBatchLivePrograms,
   isCacheFresh,
   linkChannelNamesFromPlaylist,
+  getProgramsByChannel,
+  getChannelAliases,
   EPG_CACHE_TTL_MS
 } from './src/utils/epgService.ts';
+import {
+  getAllChannelsFromDb,
+  getChannelEpgFromDb,
+  getBatchLiveProgramsFromDb,
+  getDatabaseStats,
+  queryDbForViewer,
+  seedDatabaseIfEmpty,
+  atomicSaveToDb
+} from './src/db/iptvDatabase.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,21 +67,24 @@ try {
   }
 } catch (e) {}
 
-// Initialize disk-cached EPG & pre-index channels for sub-millisecond TV lookups
+// Initialize SQLite database and disk cache
+seedDatabaseIfEmpty();
 initEpgCache();
+const initialDbStats = getDatabaseStats();
+console.log(`[IPTV Server] SQLite DB active: ${initialDbStats.channelsCount} channels, ${initialDbStats.programsCount} programs (${(initialDbStats.dbSizeBytes / 1024 / 1024).toFixed(1)} MB).`);
+
 if (cachedChannels.length > 0) {
   linkChannelNamesFromPlaylist(cachedChannels);
 }
 
 // 24-HOUR EPG CHECK: Only query the internet if cache is missing or older than 24h
-if (!isCacheFresh()) {
+if (!isCacheFresh() && !initialDbStats.isFresh) {
   console.log('[IPTV Server] EPG cache is older than 24h or missing. Starting background sync...');
   syncEpg(iptvSettings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442').catch(err => {
     console.warn('[EPG Background Sync Notice]:', err?.message || err);
   });
 } else {
-  const status = getEpgSyncStatus();
-  console.log(`[IPTV Server] 24-Hour EPG Cache is active (${status.totalProgrammes} progs across ${status.channelsCount} channels, age: ${status.cacheAgeHours}h). Internet download skipped.`);
+  console.log(`[IPTV Server] 24-Hour EPG SQLite DB is active (${initialDbStats.programsCount} progs across ${initialDbStats.channelsCount} channels). Internet download skipped.`);
 }
 
 // In-memory default MSX playlist state
@@ -404,23 +418,65 @@ function cleanCategory(raw: string): string {
   return clean || 'Общие';
 }
 
-// Real EPG endpoint for TV channels (Sub-millisecond in-memory response)
+// Real EPG endpoint for TV channels (Sub-millisecond SQLite query by channel and date)
 app.get('/api/iptv/epg', (req, res) => {
   const channelId = (req.query.channelId as string) || (req.query.tvgId as string) || '';
   const name = (req.query.name as string) || '';
   const tvgName = (req.query.tvgName as string) || '';
+  const dayOffset = req.query.dayOffset !== undefined ? parseInt(req.query.dayOffset as string, 10) : undefined;
 
-  // Instant in-memory lookup (< 1 ms), never blocks or triggers network downloads
-  const programs = getChannelEpg(channelId, name, tvgName);
-  res.json(programs);
+  let startTime: number | undefined;
+  let endTime: number | undefined;
+
+  if (dayOffset !== undefined && !isNaN(dayOffset)) {
+    const tzOffsetMs = 3 * 3600 * 1000;
+    const nowInMsk = new Date(Date.now() + tzOffsetMs);
+    const targetInMsk = new Date(nowInMsk);
+    targetInMsk.setUTCDate(targetInMsk.getUTCDate() + dayOffset);
+    targetInMsk.setUTCHours(0, 0, 0, 0);
+    startTime = targetInMsk.getTime() - tzOffsetMs;
+    endTime = startTime + 24 * 3600 * 1000;
+  }
+
+  // 1. Primary: Sub-millisecond SQLite query
+  const dbPrograms = getChannelEpgFromDb(channelId, name, tvgName, startTime, endTime);
+  if (dbPrograms.length > 0) {
+    return res.json(dbPrograms);
+  }
+
+  // 2. Secondary in-memory fallback
+  const memPrograms = getChannelEpg(channelId, name, tvgName);
+  res.json(memPrograms);
 });
 
-// EPG sync status endpoint (with cached playlist channels count for instant UI stats)
+// EPG sync status endpoint (with full SQLite database stats)
 app.get('/api/iptv/epg/status', (req, res) => {
+  const dbStats = getDatabaseStats();
+  const epgStatus = getEpgSyncStatus();
   res.json({
-    ...getEpgSyncStatus(),
-    playlistChannelsCount: cachedChannels.length
+    ...epgStatus,
+    channelsCount: dbStats.channelsCount || epgStatus.channelsCount,
+    totalProgrammes: dbStats.programsCount || epgStatus.totalProgrammes,
+    playlistChannelsCount: dbStats.channelsCount || cachedChannels.length,
+    dbStats
   });
+});
+
+// Admin SQLite Database Statistics
+app.get('/api/iptv/db/stats', (req, res) => {
+  res.json(getDatabaseStats());
+});
+
+// Admin SQLite Database Interactive Viewer (filter by channel, dayOffset, and search keyword)
+app.get('/api/iptv/db/viewer', (req, res) => {
+  const channelId = req.query.channelId as string | undefined;
+  const dayOffset = req.query.dayOffset !== undefined ? parseInt(req.query.dayOffset as string, 10) : undefined;
+  const search = req.query.search as string | undefined;
+  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
+  const offset = req.query.offset ? parseInt(req.query.offset as string, 10) : 0;
+
+  const result = queryDbForViewer({ channelId, dayOffset, search, limit, offset });
+  res.json(result);
 });
 
 // Trigger manual EPG sync (strictly follows 24-hour cache rule unless force: true is sent)
@@ -429,18 +485,19 @@ app.post('/api/iptv/epg/sync', async (req, res) => {
   const force = req.body?.force === true;
 
   try {
+    const dbStats = getDatabaseStats();
     const status = getEpgSyncStatus();
 
-    // 24-HOUR RULE: If cache is fresh, answer from cache without hitting internet
-    if (!force && status.isFresh) {
+    // 24-HOUR RULE: If database is fresh, answer from DB without hitting internet
+    if (!force && dbStats.isFresh) {
       return res.json({
         success: true,
         started: false,
         fromCache: true,
         isSyncing: false,
-        message: `Использован суточный кеш (возраст: ${status.cacheAgeHours}ч). Данные обновляются раз в сутки.`,
-        channelsCount: status.channelsCount,
-        totalProgrammes: status.totalProgrammes
+        message: `Использована суточная база SQLite (${dbStats.channelsCount} кан., ${dbStats.programsCount.toLocaleString()} передач).`,
+        channelsCount: dbStats.channelsCount,
+        totalProgrammes: dbStats.programsCount
       });
     }
 
@@ -450,8 +507,8 @@ app.post('/api/iptv/epg/sync', async (req, res) => {
         started: false,
         isSyncing: true,
         message: 'Синхронизация уже выполняется на сервере в фоне...',
-        channelsCount: status.channelsCount,
-        totalProgrammes: status.totalProgrammes
+        channelsCount: dbStats.channelsCount || status.channelsCount,
+        totalProgrammes: dbStats.programsCount || status.totalProgrammes
       });
     }
 
@@ -462,24 +519,29 @@ app.post('/api/iptv/epg/sync', async (req, res) => {
       success: true,
       started: true,
       isSyncing: true,
-      message: 'Синхронизация телепрограммы запущена в фоновом режиме',
-      channelsCount: status.channelsCount,
-      totalProgrammes: status.totalProgrammes
+      message: 'Синхронизация и обновление базы данных SQLite запущены в фоне',
+      channelsCount: dbStats.channelsCount || status.channelsCount,
+      totalProgrammes: dbStats.programsCount || status.totalProgrammes
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Live program titles for channels (fast dictionary lookup)
+// Live program titles for channels (fast dictionary lookup from SQLite)
 app.get('/api/iptv/epg/live', (req, res) => {
-  const liveMap = getBatchLivePrograms(cachedChannels);
-  res.json(liveMap);
+  let channels = getAllChannelsFromDb();
+  if (channels.length === 0) channels = cachedChannels;
+  const liveMap = getBatchLiveProgramsFromDb(channels);
+  if (Object.keys(liveMap).length > 0) {
+    return res.json(liveMap);
+  }
+  res.json(getBatchLivePrograms(channels));
 });
 
 app.post('/api/iptv/epg/live', (req, res) => {
-  const requestedChannels = req.body?.channels || cachedChannels;
-  const liveMap = getBatchLivePrograms(requestedChannels);
+  const requestedChannels = req.body?.channels || getAllChannelsFromDb() || cachedChannels;
+  const liveMap = getBatchLiveProgramsFromDb(requestedChannels);
   res.json(liveMap);
 });
 
@@ -564,13 +626,18 @@ if (iptvSettings.playlistUrl && (cachedChannels.length === 0 || Date.now() - las
 }
 
 app.get('/api/iptv/channels', async (req, res) => {
-  const targetUrl = (req.query.url as string) || iptvSettings.playlistUrl;
+  // 1. Primary: Return from SQLite database instantly
+  const dbChannels = getAllChannelsFromDb();
+  if (dbChannels.length > 0) {
+    return res.json(dbChannels);
+  }
 
-  // Instant response if channels are already in cache (< 24 hours)
+  // 2. Secondary: in-memory cache
   if (cachedChannels.length > 0 && Date.now() - lastPlaylistFetchTime < PLAYLIST_CACHE_TTL_MS) {
     return res.json(cachedChannels);
   }
 
+  const targetUrl = (req.query.url as string) || iptvSettings.playlistUrl;
   const channels = await fetchAndCacheChannels(targetUrl);
   res.json(channels);
 });

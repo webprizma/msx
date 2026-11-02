@@ -12,8 +12,10 @@ import {
   Clock,
   Radio,
   Check,
-  Zap
+  Zap,
+  Database
 } from 'lucide-react';
+import { IptvDbViewer } from './IptvDbViewer';
 
 interface IptvSettingsTabProps {
   onGoToPlayer?: () => void;
@@ -476,6 +478,9 @@ export const IptvSettingsTab: React.FC<IptvSettingsTabProps> = ({ onGoToPlayer }
           </button>
         </div>
       </form>
+
+      {/* SQLite Database Viewer & Explorer */}
+      <IptvDbViewer />
     </div>
   );
 };
