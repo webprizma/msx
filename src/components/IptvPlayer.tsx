@@ -21,7 +21,8 @@ import {
   ArrowLeft,
   Info,
   RefreshCw,
-  Maximize2
+  Maximize2,
+  Play
 } from 'lucide-react';
 
 interface IptvPlayerProps {
@@ -1194,6 +1195,23 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             break;
 
           case 'OK':
+          case 'GUIDE':
+            if (filteredChannels[focusedChannelIndex]) {
+              const ch = filteredChannels[focusedChannelIndex];
+              setIsArchiveMode(false);
+              archiveBaseTimestampRef.current = 0;
+              currentArchivePlaybackTimeRef.current = 0;
+              setIsStalled(false);
+              setReconnectAttempt(0);
+              setPlayerError(null);
+              setSelectedChannel(ch);
+              setSelectedDayOffset(0);
+              playStream(ch.streamUrl, false);
+              setOverlayMode('epg');
+            }
+            break;
+
+          case 'PLAY_PAUSE':
             if (filteredChannels[focusedChannelIndex]) {
               const ch = filteredChannels[focusedChannelIndex];
               setIsArchiveMode(false);
@@ -1206,15 +1224,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               setSelectedDayOffset(0);
               playStream(ch.streamUrl, false);
               setOverlayMode('none');
-            }
-            break;
-
-          case 'GUIDE':
-            if (filteredChannels[focusedChannelIndex]) {
-              const ch = filteredChannels[focusedChannelIndex];
-              setSelectedChannel(ch);
-              setSelectedDayOffset(0);
-              setOverlayMode('epg');
             }
             break;
 
@@ -1771,7 +1780,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                 Телеканалы
               </h2>
               <p style={{ fontSize: '11px', color: '#94a3b8', margin: '4px 0 0 0' }}>
-                {filteredChannels.length} каналов · <b style={{ color: '#38bdf8' }}>OK:</b> включить канал · Guide: EPG
+                {filteredChannels.length} каналов · <b style={{ color: '#38bdf8' }}>OK:</b> программа передач
               </p>
             </div>
             <button
@@ -1857,6 +1866,19 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                     key={channel.id || actualIndex}
                     id={`ch-item-${actualIndex}`}
                     onClick={() => {
+                      setIsArchiveMode(false);
+                      archiveBaseTimestampRef.current = 0;
+                      currentArchivePlaybackTimeRef.current = 0;
+                      setIsStalled(false);
+                      setReconnectAttempt(0);
+                      setPlayerError(null);
+                      setSelectedChannel(channel);
+                      playStream(channel.streamUrl, false);
+                      setFocusedChannelIndex(actualIndex);
+                      setSelectedDayOffset(0);
+                      setOverlayMode('epg');
+                    }}
+                    onDoubleClick={() => {
                       setIsArchiveMode(false);
                       archiveBaseTimestampRef.current = 0;
                       currentArchivePlaybackTimeRef.current = 0;
@@ -1955,6 +1977,37 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <button
+                        title="Включить прямой эфир на весь экран"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setIsArchiveMode(false);
+                          archiveBaseTimestampRef.current = 0;
+                          currentArchivePlaybackTimeRef.current = 0;
+                          setIsStalled(false);
+                          setReconnectAttempt(0);
+                          setPlayerError(null);
+                          setSelectedChannel(channel);
+                          playStream(channel.streamUrl, false);
+                          setOverlayMode('none');
+                        }}
+                        style={{
+                          backgroundColor: 'rgba(34, 197, 94, 0.2)',
+                          border: '1px solid rgba(34, 197, 94, 0.5)',
+                          borderRadius: '6px',
+                          color: '#4ade80',
+                          fontSize: '11px',
+                          fontWeight: 'bold',
+                          padding: '3px 8px',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '4px'
+                        }}
+                      >
+                        <Play style={{ width: '11px', height: '11px', fill: 'currentColor' }} />
+                        Эфир
+                      </button>
+                      <button
                         title="Программа передач (EPG)"
                         onClick={(e) => {
                           e.stopPropagation();
@@ -1963,13 +2016,13 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                           setOverlayMode('epg');
                         }}
                         style={{
-                          backgroundColor: 'rgba(56, 189, 248, 0.15)',
-                          border: '1px solid rgba(56, 189, 248, 0.4)',
+                          backgroundColor: 'rgba(56, 189, 248, 0.2)',
+                          border: '1px solid rgba(56, 189, 248, 0.5)',
                           borderRadius: '6px',
                           color: '#38bdf8',
-                          fontSize: '10px',
+                          fontSize: '11px',
                           fontWeight: 'bold',
-                          padding: '3px 7px',
+                          padding: '3px 8px',
                           cursor: 'pointer'
                         }}
                       >
@@ -2008,7 +2061,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             }}
           >
             <span>▲▼ Каналы · ◄► Группы</span>
-            <span style={{ color: '#38bdf8', fontWeight: 'bold' }}>ОК: Включить · Guide: EPG</span>
+            <span style={{ color: '#38bdf8', fontWeight: 'bold' }}>ОК: Программа (EPG) · Play: Эфир</span>
           </div>
         </div>
       )}
