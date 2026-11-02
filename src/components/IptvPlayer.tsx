@@ -136,6 +136,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   const [isStalled, setIsStalled] = useState(false);
   const [stallReason, setStallReason] = useState<'buffering' | 'offline' | 'reconnecting'>('buffering');
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [bufferedSeconds, setBufferedSeconds] = useState<number>(0);
+  const [stallElapsed, setStallElapsed] = useState<number>(0);
 
   // Live programs mapping across all channels (channelId / channelName -> programTitle)
   const [liveProgramsMap, setLiveProgramsMap] = useState<Record<string, string>>({});
@@ -687,26 +689,66 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     return Date.now();
   }, [isArchiveMode, seekTimestamp]);
 
-  // Stream Playback Handler with HLS.js
-  const playStream = useCallback((streamUrl: string) => {
+  // Helper: calculate how many seconds are currently buffered ahead of playback position
+  const getBufferedAhead = (v: HTMLVideoElement | null): number => {
+    if (!v || !v.buffered || v.buffered.length === 0) return 0;
+    const cur = v.currentTime;
+    for (let i = 0; i < v.buffered.length; i++) {
+      const start = v.buffered.start(i);
+      const end = v.buffered.end(i);
+      if (cur >= start - 0.25 && cur <= end) {
+        return Math.max(0, end - cur);
+      }
+    }
+    return 0;
+  };
+
+  // Stream Playback Handler with HLS.js (Adaptive buffer cache for Archive vs Live)
+  const playStream = useCallback((streamUrl: string, forceArchive?: boolean) => {
     setPlayerError(null);
     setIsLoadingStream(true);
     setIsStalled(false);
+    setBufferedSeconds(0);
+    setStallElapsed(0);
     lastTimeUpdateRef.current = Date.now();
 
     const video = videoRef.current;
     if (!video) return;
 
     if (hlsRef.current) {
-      hlsRef.current.destroy();
+      try {
+        hlsRef.current.destroy();
+      } catch {
+        // ignore
+      }
       hlsRef.current = null;
     }
 
+    // Determine if stream is an archive / timeshift or live stream
+    const isArchive = forceArchive !== undefined
+      ? forceArchive
+      : (isArchiveMode || streamUrl.includes('utc=') || streamUrl.includes('lutc=') || streamUrl.includes('/timeshift/'));
+
     if (Hls.isSupported()) {
+      // Extended Buffer Configuration:
+      // Archive mode preloads up to 120-300s ahead into memory for instant rewind and zero stutter.
+      // Live mode keeps a generous 60-120s buffer with a 5-segment cushion behind live edge.
       const hls = new Hls({
         enableWorker: true,
-        lowLatencyMode: true,
-        backBufferLength: 90
+        lowLatencyMode: false,
+        backBufferLength: isArchive ? 120 : 60,
+        maxBufferLength: isArchive ? 120 : 60,
+        maxMaxBufferLength: isArchive ? 300 : 120,
+        maxBufferSize: (isArchive ? 128 : 64) * 1024 * 1024,
+        liveSyncDurationCount: 5,
+        liveMaxLatencyDurationCount: 15,
+        maxBufferHole: 1.0,
+        highBufferWatchdogPeriod: 3,
+        fragLoadingTimeOut: 30000,
+        fragLoadingMaxRetry: 6,
+        fragLoadingRetryDelay: 500,
+        manifestLoadingTimeOut: 20000,
+        manifestLoadingMaxRetry: 4
       });
       hlsRef.current = hls;
 
@@ -751,12 +793,12 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         setIsStalled(false);
         setReconnectAttempt(0);
         video.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
-      });
+      }, { once: true });
     } else {
       setPlayerError('Браузер не поддерживает HLS потоки.');
       setIsLoadingStream(false);
     }
-  }, []);
+  }, [isArchiveMode]);
 
   // Jump to Live Broadcast
   const handleJumpToLive = useCallback(() => {
@@ -770,7 +812,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     setCurrentPlayingProgram(liveProg);
     setActiveTimelineProgram(liveProg);
     setSeekTimestamp(Date.now());
-    playStream(selectedChannel.streamUrl);
+    playStream(selectedChannel.streamUrl, false);
   }, [selectedChannel, epgList, playStream]);
 
   // Seamless Stream Recovery Watchdog (without full page reload)
@@ -799,7 +841,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       archiveBaseTimestampRef.current = currentTs;
       currentArchivePlaybackTimeRef.current = currentTs;
       setSeekTimestamp(currentTs);
-      playStream(archiveUrl);
+      playStream(archiveUrl, true);
     } else if (selectedChannel) {
       if (hlsRef.current) {
         try {
@@ -807,15 +849,15 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           hlsRef.current.startLoad();
           video.play().catch(() => {});
         } catch {
-          playStream(selectedChannel.streamUrl);
+          playStream(selectedChannel.streamUrl, false);
         }
       } else {
-        playStream(selectedChannel.streamUrl);
+        playStream(selectedChannel.streamUrl, false);
       }
     }
   }, [isArchiveMode, getCurrentPlaybackTimestamp, selectedChannel, epgList, playStream]);
 
-  // Watchdog effect: automatically detects stream stalls and seamlessly reconnects
+  // Watchdog effect: checks buffered lookahead, gently nudges player, and only reconnects after 18s of true starvation
   useEffect(() => {
     const interval = setInterval(() => {
       const video = videoRef.current;
@@ -833,12 +875,46 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       }
 
       const elapsed = Date.now() - lastTimeUpdateRef.current;
-      if (elapsed >= 3500) {
+      const bufAhead = getBufferedAhead(video);
+      setBufferedSeconds(bufAhead);
+      setStallElapsed(elapsed);
+
+      // Case 1: Video has data buffered ahead (>= 1.2s), but video element paused or hit PTS gap
+      if (bufAhead >= 1.2) {
+        if (elapsed >= 3500) {
+          if (video.paused) {
+            video.play().catch(() => {});
+          } else if (hlsRef.current) {
+            hlsRef.current.recoverMediaError();
+          }
+          // If stuck for > 8s despite having buffer ahead, skip tiny PTS gap
+          if (elapsed >= 8000) {
+            video.currentTime += 0.15;
+            lastTimeUpdateRef.current = Date.now();
+          }
+        } else if (isStalled) {
+          setIsStalled(false);
+          setReconnectAttempt(0);
+        }
+        return;
+      }
+
+      // Case 2: Buffer underrun (bufAhead < 1.0s) - waiting for network chunks
+      if (elapsed >= 4000) {
         setIsStalled(true);
         setStallReason(prev => (prev === 'reconnecting' ? 'reconnecting' : 'buffering'));
 
-        // If frozen for 5.5s, trigger seamless auto-recovery
-        if (elapsed >= 5500) {
+        // At 10s: soft network reload (startLoad) without tearing down HLS
+        if (elapsed >= 10000 && elapsed < 12000 && hlsRef.current) {
+          try {
+            hlsRef.current.startLoad();
+          } catch {
+            // ignore
+          }
+        }
+
+        // Only after 18s of continuous freeze with zero buffer: trigger full reconnect
+        if (elapsed >= 18000) {
           lastTimeUpdateRef.current = Date.now();
           handleRecoverStream(false);
         }
@@ -982,6 +1058,20 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     if (code === 427 || code === 33) return 'CHANNEL_UP';
     if (code === 428 || code === 34) return 'CHANNEL_DOWN';
 
+    // Guide / Info / EPG
+    if (
+      code === 457 ||
+      code === 458 ||
+      code === 462 ||
+      code === 73 ||
+      key === 'i' ||
+      key === 'info' ||
+      key === 'guide' ||
+      key === 'epg'
+    ) {
+      return 'GUIDE';
+    }
+
     return key;
   }, []);
 
@@ -1017,6 +1107,13 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               setFocusedChannelIndex(idx !== -1 ? idx : 0);
             }
             setOverlayMode('channels');
+            break;
+
+          case 'GUIDE':
+            if (selectedChannel) {
+              setSelectedDayOffset(0);
+              setOverlayMode('epg');
+            }
             break;
 
           case 'DOWN':
@@ -1137,7 +1234,16 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               setPlayerError(null);
               setSelectedChannel(ch);
               setSelectedDayOffset(0);
-              playStream(ch.streamUrl);
+              playStream(ch.streamUrl, false);
+              setOverlayMode('none');
+            }
+            break;
+
+          case 'GUIDE':
+            if (filteredChannels[focusedChannelIndex]) {
+              const ch = filteredChannels[focusedChannelIndex];
+              setSelectedChannel(ch);
+              setSelectedDayOffset(0);
               setOverlayMode('epg');
             }
             break;
@@ -1184,7 +1290,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               if (selectedChannel) {
                 setIsArchiveMode(false);
                 archiveBaseTimestampRef.current = 0;
-                playStream(selectedChannel.streamUrl);
+                playStream(selectedChannel.streamUrl, false);
               }
               break;
             }
@@ -1253,7 +1359,9 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           case 'LEFT':
           case 'REWIND':
             {
-              const newTime = seekTimestamp - 60000;
+              // When starting a new rewind action, calculate from current live/archive playback position!
+              const baseTime = seekDebounceTimeoutRef.current ? seekTimestamp : getCurrentPlaybackTimestamp();
+              const newTime = baseTime - 60000;
               setSeekTimestamp(newTime);
 
               // Auto-switch to previous program if seek moves past program start!
@@ -1273,7 +1381,9 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           case 'FAST_FORWARD':
             {
               const now = Date.now();
-              const newTime = Math.min(now, seekTimestamp + 60000);
+              // When starting a new fast-forward action, calculate from current live/archive playback position!
+              const baseTime = seekDebounceTimeoutRef.current ? seekTimestamp : getCurrentPlaybackTimestamp();
+              const newTime = Math.min(now, baseTime + 60000);
               setSeekTimestamp(newTime);
 
               // Auto-switch to next program if seek moves past program end!
@@ -1397,6 +1507,9 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             if (isArchiveMode && archiveBaseTimestampRef.current > 0) {
               const currentTimestamp = archiveBaseTimestampRef.current + Math.floor(cur * 1000);
               currentArchivePlaybackTimeRef.current = currentTimestamp;
+              if (overlayMode !== 'timeline') {
+                setSeekTimestamp(currentTimestamp);
+              }
             }
           }}
           onPlaying={() => {
@@ -1485,12 +1598,16 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                   ? 'Отсутствует подключение к интернету'
                   : stallReason === 'reconnecting'
                   ? `Повторный запрос к потоку (попытка ${reconnectAttempt})...`
+                  : bufferedSeconds > 0
+                  ? `Наполнение буфера (${bufferedSeconds.toFixed(1)}с)...`
                   : 'Поток приостановлен (буферизация)...'}
               </p>
               <p style={{ margin: '2px 0 0 0', fontSize: '12px', color: '#94a3b8' }}>
                 {stallReason === 'offline'
                   ? 'Проверьте сетевое подключение Wi-Fi или LAN-кабель'
-                  : 'Автоматический повторный запрос без перезагрузки экрана'}
+                  : stallReason === 'reconnecting'
+                  ? 'Ожидание ответа сервера потока...'
+                  : `Авто-переподключение через ${Math.max(0, Math.ceil((18000 - stallElapsed) / 1000))}с`}
               </p>
             </div>
             <button
@@ -1684,7 +1801,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                 Телеканалы
               </h2>
               <p style={{ fontSize: '11px', color: '#94a3b8', margin: '4px 0 0 0' }}>
-                {filteredChannels.length} каналов · <b style={{ color: '#38bdf8' }}>OK:</b> открыть передачу
+                {filteredChannels.length} каналов · <b style={{ color: '#38bdf8' }}>OK:</b> включить канал · Guide: EPG
               </p>
             </div>
             <button
@@ -1777,10 +1894,10 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                       setReconnectAttempt(0);
                       setPlayerError(null);
                       setSelectedChannel(channel);
-                      playStream(channel.streamUrl);
+                      playStream(channel.streamUrl, false);
                       setFocusedChannelIndex(actualIndex);
                       setSelectedDayOffset(0);
-                      setOverlayMode('epg');
+                      setOverlayMode('none');
                     }}
                     style={{
                       position: 'absolute',
@@ -1866,19 +1983,42 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                       )}
                     </div>
 
-                    <span
-                      style={{
-                        fontSize: '10px',
-                        fontWeight: 'bold',
-                        padding: '2px 6px',
-                        borderRadius: '8px',
-                        backgroundColor: 'rgba(245, 158, 11, 0.25)',
-                        color: '#fbbf24',
-                        border: '1px solid rgba(245, 158, 11, 0.4)'
-                      }}
-                    >
-                      7д
-                    </span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <button
+                        title="Программа передач (EPG)"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedChannel(channel);
+                          setSelectedDayOffset(0);
+                          setOverlayMode('epg');
+                        }}
+                        style={{
+                          backgroundColor: 'rgba(56, 189, 248, 0.15)',
+                          border: '1px solid rgba(56, 189, 248, 0.4)',
+                          borderRadius: '6px',
+                          color: '#38bdf8',
+                          fontSize: '10px',
+                          fontWeight: 'bold',
+                          padding: '3px 7px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        EPG
+                      </button>
+                      <span
+                        style={{
+                          fontSize: '10px',
+                          fontWeight: 'bold',
+                          padding: '2px 6px',
+                          borderRadius: '8px',
+                          backgroundColor: 'rgba(245, 158, 11, 0.25)',
+                          color: '#fbbf24',
+                          border: '1px solid rgba(245, 158, 11, 0.4)'
+                        }}
+                      >
+                        7д
+                      </span>
+                    </div>
                   </div>
                 );
               })}
@@ -1898,7 +2038,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             }}
           >
             <span>▲▼ Каналы · ◄► Группы</span>
-            <span style={{ color: '#38bdf8', fontWeight: 'bold' }}>ОК: Программа</span>
+            <span style={{ color: '#38bdf8', fontWeight: 'bold' }}>ОК: Включить · Guide: EPG</span>
           </div>
         </div>
       )}

@@ -123,23 +123,44 @@ export const IptvSettingsTab: React.FC<IptvSettingsTabProps> = ({ onGoToPlayer }
 
   const handleSyncEpgNow = async () => {
     setIsSyncingEpg(true);
-    showStatus('Синхронизация EPG телепрограммы запущена на сервере...', 'info');
+    showStatus('Запуск фоновой синхронизации телегида...', 'info');
     try {
       const res = await fetch('/api/iptv/epg/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ epgUrl: inputEpgUrl.trim() })
+        body: JSON.stringify({ epgUrl: inputEpgUrl.trim() }),
+        signal: AbortSignal.timeout(10000)
       });
       const data = await res.json();
-      if (data.success) {
-        showStatus(`✓ ${data.message || 'Телепрограмма успешно обновлена!'}`, 'success');
-        fetchStats();
-      } else {
-        showStatus(`Ошибка обновления EPG: ${data.message || data.error}`, 'error');
-      }
+      showStatus(data.message || 'Синхронизация выполняется в фоне на сервере...', 'info');
+
+      // Poll status every 2 seconds until finished
+      let pollCount = 0;
+      const pollTimer = setInterval(async () => {
+        pollCount++;
+        try {
+          const statusRes = await fetch('/api/iptv/epg/status', { signal: AbortSignal.timeout(5000) });
+          if (statusRes.ok) {
+            const st = await statusRes.json();
+            setEpgStatus(st);
+            if (!st.isSyncing || pollCount >= 60) {
+              clearInterval(pollTimer);
+              setIsSyncingEpg(false);
+              showStatus(`✓ Телепрограмма успешно обновлена! ${st.totalProgrammes?.toLocaleString()} передач для ${st.channelsCount} каналов.`, 'success');
+              fetchStats();
+            } else {
+              showStatus(`Идёт обработка телепрограммы... Загружено передач: ${st.totalProgrammes?.toLocaleString()} (${st.channelsCount} каналов)`, 'info');
+            }
+          }
+        } catch (pollErr) {
+          if (pollCount >= 60) {
+            clearInterval(pollTimer);
+            setIsSyncingEpg(false);
+          }
+        }
+      }, 2000);
     } catch (e: any) {
-      showStatus(`Ошибка сети: ${e.message}`, 'error');
-    } finally {
+      showStatus(`Ошибка запуска синхронизации: ${e.message}`, 'error');
       setIsSyncingEpg(false);
     }
   };

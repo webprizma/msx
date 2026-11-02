@@ -394,12 +394,33 @@ app.get('/api/iptv/epg/status', (req, res) => {
   res.json(getEpgSyncStatus());
 });
 
-// Trigger manual EPG sync
+// Trigger manual EPG sync (starts in background and returns immediate response to prevent client timeouts)
 app.post('/api/iptv/epg/sync', async (req, res) => {
   const targetEpgUrl = req.body?.epgUrl || iptvSettings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442';
   try {
-    const result = await syncEpg(targetEpgUrl);
-    res.json(result);
+    const status = getEpgSyncStatus();
+    if (status.isSyncing) {
+      return res.json({
+        success: true,
+        started: false,
+        isSyncing: true,
+        message: 'Синхронизация уже выполняется на сервере в фоне...',
+        channelsCount: status.channelsCount,
+        totalProgrammes: status.totalProgrammes
+      });
+    }
+
+    // Launch background task
+    syncEpg(targetEpgUrl).catch(e => console.error('[Background EPG Sync Notice]:', e?.message || e));
+
+    res.json({
+      success: true,
+      started: true,
+      isSyncing: true,
+      message: 'Синхронизация телепрограммы запущена в фоновом режиме',
+      channelsCount: status.channelsCount,
+      totalProgrammes: status.totalProgrammes
+    });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
