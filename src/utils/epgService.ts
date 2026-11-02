@@ -220,9 +220,8 @@ export function initEpgCache() {
                 isLive: now >= start && now < end,
                 hasArchive: end <= now
               }));
-              const deduped = deduplicateEpg(restored);
-              programsByChannel.set(chId, deduped);
-              count += deduped.length;
+              programsByChannel.set(chId, restored);
+              count += restored.length;
             }
           }
         }

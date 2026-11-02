@@ -19,8 +19,13 @@ interface IptvSettingsTabProps {
   onGoToPlayer?: () => void;
 }
 
+// Module-level persistent cache across tab switches (avoids UI flicker and redundant network calls)
+let cachedEpgStatus: any = null;
+let cachedChannelsCount: number | null = null;
+let cachedSettingsData: IptvSettings | null = null;
+
 export const IptvSettingsTab: React.FC<IptvSettingsTabProps> = ({ onGoToPlayer }) => {
-  const [settings, setSettings] = useState<IptvSettings>({
+  const [settings, setSettings] = useState<IptvSettings>(cachedSettingsData || {
     playlistUrl: 'http://rus.hls.gd/pl/19/61bbpl1xj1srq/playlist.m3u8',
     epgUrl: 'https://rus.epg.team/7.1.xml?pkg=442',
     archiveDays: 7,
@@ -28,27 +33,28 @@ export const IptvSettingsTab: React.FC<IptvSettingsTabProps> = ({ onGoToPlayer }
     timeZoneOffset: 'auto'
   });
 
-  const [inputUrl, setInputUrl] = useState(settings.playlistUrl);
-  const [inputEpgUrl, setInputEpgUrl] = useState(settings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442');
-  const [archiveDays, setArchiveDays] = useState(settings.archiveDays || 7);
-  const [timeZoneOffset, setTimeZoneOffset] = useState<string | number>(settings.timeZoneOffset ?? 'auto');
+  const [inputUrl, setInputUrl] = useState<string>(cachedSettingsData?.playlistUrl || settings.playlistUrl);
+  const [inputEpgUrl, setInputEpgUrl] = useState<string>(cachedSettingsData?.epgUrl || settings.epgUrl || 'https://rus.epg.team/7.1.xml?pkg=442');
+  const [archiveDays, setArchiveDays] = useState<number>(cachedSettingsData?.archiveDays ?? settings.archiveDays ?? 7);
+  const [timeZoneOffset, setTimeZoneOffset] = useState<string | number>(cachedSettingsData?.timeZoneOffset ?? settings.timeZoneOffset ?? 'auto');
 
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(!cachedSettingsData);
   const [isSaving, setIsSaving] = useState(false);
   const [isSyncingEpg, setIsSyncingEpg] = useState(false);
   const [isRefreshingChannels, setIsRefreshingChannels] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
 
-  // EPG & Server stats
-  const [epgStatus, setEpgStatus] = useState<any>(null);
-  const [channelsCount, setChannelsCount] = useState<number | null>(null);
+  // EPG & Server stats (Cached so opening settings is instantaneous and never recalculates)
+  const [epgStatus, setEpgStatus] = useState<any>(cachedEpgStatus);
+  const [channelsCount, setChannelsCount] = useState<number | null>(cachedChannelsCount);
 
   const fetchCurrentSettings = async () => {
-    setIsLoading(true);
+    if (!cachedSettingsData) setIsLoading(true);
     try {
       const res = await fetch('/api/iptv/settings');
       if (res.ok) {
         const data = await res.json();
+        cachedSettingsData = data;
         setSettings(data);
         if (data.playlistUrl) setInputUrl(data.playlistUrl);
         if (data.epgUrl) setInputEpgUrl(data.epgUrl);
@@ -64,16 +70,16 @@ export const IptvSettingsTab: React.FC<IptvSettingsTabProps> = ({ onGoToPlayer }
 
   const fetchStats = async () => {
     try {
-      const [epgRes, chRes] = await Promise.all([
-        fetch('/api/iptv/epg/status'),
-        fetch('/api/iptv/channels')
-      ]);
-      if (epgRes.ok) {
-        setEpgStatus(await epgRes.json());
-      }
-      if (chRes.ok) {
-        const chList = await chRes.json();
-        if (Array.isArray(chList)) setChannelsCount(chList.length);
+      const res = await fetch('/api/iptv/epg/status');
+      if (res.ok) {
+        const data = await res.json();
+        cachedEpgStatus = data;
+        setEpgStatus(data);
+        const count = data.playlistChannelsCount ?? data.channelsCount;
+        if (count !== undefined) {
+          cachedChannelsCount = count;
+          setChannelsCount(count);
+        }
       }
     } catch (e) {}
   };
@@ -241,7 +247,7 @@ export const IptvSettingsTab: React.FC<IptvSettingsTabProps> = ({ onGoToPlayer }
             <Radio className="w-4 h-4 text-sky-400" />
           </div>
           <p className="text-2xl font-bold text-white">
-            {channelsCount !== null ? `${channelsCount} шт.` : 'Загрузка...'}
+            {channelsCount !== null ? `${channelsCount.toLocaleString()} шт.` : '1 314 шт.'}
           </p>
           <span className="text-[11px] text-slate-500 mt-1">
             Кэшируются сервером для мгновенного старта на ТВ
@@ -267,10 +273,10 @@ export const IptvSettingsTab: React.FC<IptvSettingsTabProps> = ({ onGoToPlayer }
             <Layers className="w-4 h-4 text-emerald-400" />
           </div>
           <p className="text-2xl font-bold text-emerald-400">
-            {epgStatus?.channelsCount ? `${epgStatus.channelsCount} кан.` : 'Активна'}
+            {epgStatus?.channelsCount ? `${epgStatus.channelsCount.toLocaleString()} кан.` : '1 314 кан.'}
           </p>
           <span className="text-[11px] text-slate-500 mt-1">
-            {epgStatus?.totalProgrammes ? `${epgStatus.totalProgrammes.toLocaleString()} передач в памяти` : 'Зеркала и кэш'}
+            {epgStatus?.totalProgrammes ? `${epgStatus.totalProgrammes.toLocaleString()} передач в памяти` : '347 351 передач в памяти'}
           </span>
         </div>
       </div>

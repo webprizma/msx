@@ -384,8 +384,8 @@ app.post('/api/iptv/settings', async (req, res) => {
     }
 
     // If EPG URL was changed, trigger re-sync in background
-    if (req.body.epgUrl && req.body.epgUrl !== oldEpgUrl) {
-      syncEpg(req.body.epgUrl).catch(e => console.error('[EPG Sync Error]', e));
+    if (req.body.epgUrl && req.body.epgUrl.trim() !== (oldEpgUrl || '').trim()) {
+      syncEpg(req.body.epgUrl.trim(), true).catch(e => console.error('[EPG Sync Error]', e));
     }
 
     res.json({ success: true, settings: iptvSettings });
@@ -415,9 +415,12 @@ app.get('/api/iptv/epg', (req, res) => {
   res.json(programs);
 });
 
-// EPG sync status endpoint
+// EPG sync status endpoint (with cached playlist channels count for instant UI stats)
 app.get('/api/iptv/epg/status', (req, res) => {
-  res.json(getEpgSyncStatus());
+  res.json({
+    ...getEpgSyncStatus(),
+    playlistChannelsCount: cachedChannels.length
+  });
 });
 
 // Trigger manual EPG sync (strictly follows 24-hour cache rule unless force: true is sent)
