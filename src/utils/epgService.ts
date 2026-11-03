@@ -1,82 +1,37 @@
-import fs from 'fs';
-import path from 'path';
 import zlib from 'zlib';
 import { Readable } from 'stream';
-import { fileURLToPath } from 'url';
 import type { EpgProgram } from '../types/iptv.ts';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const CACHE_DIR = path.resolve(__dirname, '../../iptv-cache');
-const CACHE_FILE_GZ = path.join(CACHE_DIR, 'epg-data.json.gz');
+import { createEpgStreamWriter, getDatabaseStats } from '../db/iptvDatabase.ts';
 
 // Verified reliable Russian / CIS IPTV EPG mirrors
 export const EPG_MIRROR_SOURCES: string[] = [
+  'https://rus.epg.team/7.1.xml.gz?pkg=442',
   'https://rus.epg.team/7.1.xml?pkg=442',
   'https://epg.it999.ru/epg2.xml.gz',
   'https://epg.it999.ru/edem.xml.gz',
-  'https://iptvx.one/epg/epg_lite.xml.gz',
-  'http://programtv.ru/xmltv.xml.gz'
+  'https://iptvx.one/epg/epg_lite.xml.gz'
 ];
 
-// In-memory cache for ultra-fast lookups
-const programsByChannel = new Map<string, EpgProgram[]>();
-const channelAliases = new Map<string, string>(); // normalized name -> tvgId
 let isSyncing = false;
-let lastSyncTime = 0;
-let totalProgrammesCount = 0;
 let currentMirrorSource = EPG_MIRROR_SOURCES[0];
 
 export const EPG_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-export function getProgramsByChannel(): Map<string, EpgProgram[]> {
-  return programsByChannel;
-}
-
-export function getChannelAliases(): Map<string, string> {
-  return channelAliases;
-}
-
 export function isCacheFresh(): boolean {
-  return programsByChannel.size > 0 && totalProgrammesCount > 0 && (Date.now() - lastSyncTime < EPG_CACHE_TTL_MS);
-}
-
-export function linkChannelNamesFromPlaylist(channels: any[]) {
-  if (!Array.isArray(channels)) return;
-  for (const ch of channels) {
-    const targetId = ch.tvgId || ch.id;
-    if (!targetId) continue;
-    if (ch.id) {
-      channelAliases.set(ch.id, targetId);
-      channelAliases.set(normalizeName(ch.id), targetId);
-    }
-    if (ch.tvgId) {
-      channelAliases.set(ch.tvgId, ch.tvgId);
-      channelAliases.set(normalizeName(ch.tvgId), ch.tvgId);
-    }
-    if (ch.name) {
-      channelAliases.set(normalizeName(ch.name), targetId);
-      const stripped = stripSuffixes(ch.name);
-      if (stripped) channelAliases.set(normalizeName(stripped), targetId);
-    }
-    if (ch.tvgName) {
-      channelAliases.set(normalizeName(ch.tvgName), targetId);
-      const stripped = stripSuffixes(ch.tvgName);
-      if (stripped) channelAliases.set(normalizeName(stripped), targetId);
-    }
-  }
-  console.log(`[EPG Service] Pre-indexed ${channels.length} channels from playlist into memory. Total fast aliases: ${channelAliases.size}`);
+  const stats = getDatabaseStats();
+  return stats.isFresh;
 }
 
 export function getEpgSyncStatus() {
-  const ageHours = lastSyncTime > 0 ? ((Date.now() - lastSyncTime) / 3600000).toFixed(1) : '0';
+  const stats = getDatabaseStats();
+  const ageHours = stats.lastSyncTime > 0 ? ((Date.now() - stats.lastSyncTime) / 3600000).toFixed(1) : '0';
   return {
     isSyncing,
-    channelsCount: programsByChannel.size,
-    totalProgrammes: totalProgrammesCount,
-    lastSyncTime,
+    channelsCount: stats.channelsCount,
+    totalProgrammes: stats.programsCount,
+    lastSyncTime: stats.lastSyncTime,
     cacheAgeHours: ageHours,
-    isFresh: isCacheFresh(),
+    isFresh: stats.isFresh,
     currentMirror: currentMirrorSource,
     mirrorsAvailable: EPG_MIRROR_SOURCES.length
   };
@@ -111,189 +66,68 @@ function normalizeName(name: string): string {
 
 function stripSuffixes(name: string): string {
   if (!name) return '';
-  // Strip HD, FHD, UHD, 4K, HDR, 50fps, double, timezone shifts (+2, +4, etc.)
   return name
     .replace(/[\s\-_]*(?:hd|fhd|uhd|4k|hdr|50fps|orig|original|double|\+2|\+4|\+6|\+7|\+8)$/i, '')
     .trim();
 }
 
-// Compact program array format: [start, end, title, category, description]
-type CompactProgram = [number, number, string, string, string];
-
 /**
- * Deduplicate programs: if multiple entries exist for the same time slot or overlapping same movie,
- * merge them into a single clean entry, prioritizing the one WITH description and without trailing dots.
+ * LOW-MEMORY STREAMING XMLTV PARSER:
+ * Reads stream chunks and pipes directly into SQLite batch writer.
+ * Never accumulates giant strings or arrays in V8 heap memory.
  */
-export function deduplicateEpg(programs: EpgProgram[]): EpgProgram[] {
-  if (!programs || programs.length <= 1) return programs || [];
+async function parseEpgFromStreamDirectToDb(
+  url: string,
+  writer: ReturnType<typeof createEpgStreamWriter>
+): Promise<{ progCount: number }> {
+  // If user passed a non-.gz URL on rus.epg.team, try adding .gz for 15x bandwidth and memory reduction
+  let requestUrl = url;
+  if (url.includes('rus.epg.team/7.1.xml') && !url.includes('.gz')) {
+    requestUrl = url.replace('7.1.xml', '7.1.xml.gz');
+  }
 
-  // Sort primarily by start time ascending, then by description length descending (richer description first)
-  const sorted = [...programs].sort((a, b) => {
-    if (a.start !== b.start) return a.start - b.start;
-    const aDescLen = (a.description || '').trim().length;
-    const bDescLen = (b.description || '').trim().length;
-    return bDescLen - aDescLen;
-  });
+  const isGz = requestUrl.toLowerCase().includes('.gz');
+  console.log(`[EPG Stream] Запрос потока телегида: ${requestUrl} (сжатие gzip: ${isGz})`);
 
-  const result: EpgProgram[] = [];
-
-  for (const prog of sorted) {
-    const cleanTitle = (prog.title || 'Передача').trim().replace(/\.+$/, '');
-    const cleanProg: EpgProgram = {
-      ...prog,
-      title: cleanTitle
-    };
-
-    if (result.length === 0) {
-      result.push(cleanProg);
-      continue;
-    }
-
-    const prev = result[result.length - 1];
-
-    // Check duplicate conditions
-    const sameStart = Math.abs(cleanProg.start - prev.start) < 90000; // within 1.5 minutes
-    const sameEnd = Math.abs(cleanProg.end - prev.end) < 90000;
-    const prevNormTitle = normalizeName(prev.title);
-    const progNormTitle = normalizeName(cleanProg.title);
-    const sameTitle =
-      prevNormTitle === progNormTitle ||
-      (prevNormTitle.length > 5 && progNormTitle.includes(prevNormTitle)) ||
-      (progNormTitle.length > 5 && prevNormTitle.includes(progNormTitle));
-
-    const isDuplicate = sameStart || (sameEnd && sameTitle) || (sameTitle && cleanProg.start < prev.end);
-
-    if (isDuplicate) {
-      const prevDesc = (prev.description || '').trim();
-      const progDesc = (cleanProg.description || '').trim();
-
-      // If new entry has richer description, prefer its description and title
-      if (progDesc.length > prevDesc.length) {
-        prev.description = cleanProg.description;
-        prev.title = cleanProg.title;
-      }
-
-      // Upgrade category if current is generic 'ТВ'
-      if ((!prev.category || prev.category === 'ТВ') && cleanProg.category && cleanProg.category !== 'ТВ') {
-        prev.category = cleanProg.category;
-      }
-
-      // Span full duration
-      prev.start = Math.min(prev.start, cleanProg.start);
-      prev.end = Math.max(prev.end, cleanProg.end);
-      const now = Date.now();
-      prev.isLive = now >= prev.start && now < prev.end;
-      prev.hasArchive = prev.end <= now;
+  let response: Response;
+  try {
+    response = await fetch(requestUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Encoding': 'gzip, deflate, br'
+      },
+      signal: AbortSignal.timeout(180000)
+    });
+  } catch (fetchErr) {
+    // If .gz variant failed (e.g. 404), fallback to original URL
+    if (requestUrl !== url) {
+      console.warn(`[EPG Stream] Gzip URL ${requestUrl} недоступен, пробую исходный URL: ${url}`);
+      response = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept-Encoding': 'gzip, deflate, br'
+        },
+        signal: AbortSignal.timeout(180000)
+      });
     } else {
-      result.push(cleanProg);
+      throw fetchErr;
     }
   }
-
-  return result;
-}
-
-// Initialize cache from disk (fast gzipped snapshot, ~4MB instead of 230MB)
-export function initEpgCache() {
-  try {
-    if (!fs.existsSync(CACHE_DIR)) {
-      fs.mkdirSync(CACHE_DIR, { recursive: true });
-    }
-
-    if (fs.existsSync(CACHE_FILE_GZ)) {
-      const gzipped = fs.readFileSync(CACHE_FILE_GZ);
-      const jsonStr = zlib.gunzipSync(gzipped).toString('utf8');
-      const parsed = JSON.parse(jsonStr);
-
-      if (parsed && typeof parsed === 'object') {
-        const now = Date.now();
-        let count = 0;
-
-        if (parsed.aliases && typeof parsed.aliases === 'object') {
-          for (const [k, v] of Object.entries(parsed.aliases)) {
-            channelAliases.set(k, String(v));
-          }
-        }
-
-        if (parsed.channels && typeof parsed.channels === 'object') {
-          for (const [chId, rawList] of Object.entries(parsed.channels)) {
-            if (Array.isArray(rawList)) {
-              const restored: EpgProgram[] = (rawList as CompactProgram[]).map(([start, end, title, cat, desc]) => ({
-                id: `epg-${chId}-${start}`,
-                channelId: chId,
-                title,
-                description: desc,
-                category: cat,
-                start,
-                end,
-                isLive: now >= start && now < end,
-                hasArchive: end <= now
-              }));
-              programsByChannel.set(chId, restored);
-              count += restored.length;
-            }
-          }
-        }
-
-        totalProgrammesCount = count;
-        lastSyncTime = parsed.timestamp || Date.now();
-        console.log(`[EPG Service] Loaded durable cache with ${count} programs for ${programsByChannel.size} channels.`);
-      }
-    }
-  } catch (e) {
-    console.warn('[EPG Service] Notice loading disk cache:', e);
-  }
-}
-
-// Asynchronously save compact gzipped snapshot to disk (~4MB)
-async function persistDurableCache() {
-  try {
-    const compactChannels: Record<string, CompactProgram[]> = {};
-    for (const [k, progs] of programsByChannel.entries()) {
-      compactChannels[k] = progs.map(p => [p.start, p.end, p.title || '', p.category || '', p.description || '']);
-    }
-
-    const snapshot = {
-      timestamp: Date.now(),
-      aliases: Object.fromEntries(channelAliases),
-      channels: compactChannels
-    };
-
-    const compressed = zlib.gzipSync(Buffer.from(JSON.stringify(snapshot), 'utf8'));
-    await fs.promises.writeFile(CACHE_FILE_GZ, compressed);
-    console.log(`[EPG Service] Successfully persisted durable cache (${(compressed.length / 1024 / 1024).toFixed(2)} MB)`);
-  } catch (saveErr) {
-    console.warn('[EPG Service] Could not persist compressed cache:', saveErr);
-  }
-}
-
-/**
- * Streams and parses XMLTV data from a single URL (supports both plain XML and GZIP).
- */
-async function parseEpgFromStream(url: string): Promise<{ channelCount: number; progCount: number }> {
-  const isGz = url.toLowerCase().includes('.gz');
-  console.log(`[EPG Service] Fetching stream from: ${url} (gzipped: ${isGz})`);
-
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept-Encoding': 'gzip, deflate, br'
-    },
-    signal: AbortSignal.timeout(120000)
-  });
 
   if (!response.ok || !response.body) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   }
 
-  // Set up chunk reader: if gzipped, decompress on-the-fly with node zlib
+  // Set up streaming decompressor or web stream
   let chunkIterable: AsyncIterable<Buffer | string>;
-  if (isGz) {
+  const isActualGz = requestUrl.toLowerCase().includes('.gz') || response.headers.get('content-encoding')?.includes('gzip');
+
+  if (isActualGz) {
     const nodeStream = Readable.fromWeb(response.body as any);
     const gunzip = zlib.createGunzip();
     nodeStream.pipe(gunzip);
     chunkIterable = gunzip;
   } else {
-    // Plain web stream
     const reader = response.body.getReader();
     const decoder = new TextDecoder('utf-8');
     chunkIterable = {
@@ -310,41 +144,35 @@ async function parseEpgFromStream(url: string): Promise<{ channelCount: number; 
   }
 
   let buffer = '';
-  const tempMap = new Map<string, EpgProgram[]>();
-  let totalProgrammes = 0;
-  let lastFlushTime = Date.now();
 
   for await (const chunk of chunkIterable) {
     const chunkStr = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
     buffer += chunkStr;
 
-    // 1. Extract channels and ALL their <display-name> aliases
-    const chBlockRegex = /<channel\s+id="([^"]+)">([\s\S]*?)<\/channel>/gi;
+    // 1. Parse <channel id="..."> tags
+    const chRegex = /<channel\s+id="([^"]+)">([\s\S]*?)<\/channel>/gi;
     let chMatch;
     let lastChIndex = 0;
-    while ((chMatch = chBlockRegex.exec(buffer)) !== null) {
-      lastChIndex = chBlockRegex.lastIndex;
+    while ((chMatch = chRegex.exec(buffer)) !== null) {
+      lastChIndex = chRegex.lastIndex;
       const chId = chMatch[1];
-      const inner = chMatch[2];
-
-      // Index direct chId normalized
-      channelAliases.set(normalizeName(chId), chId);
+      writer.addAlias(chId, chId);
 
       const dispRegex = /<display-name[^>]*>([^<]+)<\/display-name>/gi;
       let dMatch;
-      while ((dMatch = dispRegex.exec(inner)) !== null) {
+      while ((dMatch = dispRegex.exec(chMatch[2])) !== null) {
         const rawName = decodeXmlEntities(dMatch[1]).trim();
         if (rawName) {
-          channelAliases.set(normalizeName(rawName), chId);
+          writer.addAlias(rawName, chId);
           const stripped = stripSuffixes(rawName);
           if (stripped && stripped !== rawName) {
-            channelAliases.set(normalizeName(stripped), chId);
+            writer.addAlias(stripped, chId);
           }
         }
       }
     }
 
-    // 2. Extract programmes <programme ...> ... </programme>
+    // 2. Parse <programme ...> tags and stream directly into SQLite
     const progRegex = /<programme\s+([^>]+)>([\s\S]*?)<\/programme>/gi;
     let progMatch;
     let lastProgIndex = 0;
@@ -357,7 +185,6 @@ async function parseEpgFromStream(url: string): Promise<{ channelCount: number; 
       const chIdMatch = attrs.match(/channel="([^"]+)"/i);
       const startMatch = attrs.match(/start="([^"]+)"/i);
       const stopMatch = attrs.match(/stop="([^"]+)"/i);
-
       if (!chIdMatch || !startMatch || !stopMatch) continue;
 
       const chId = chIdMatch[1];
@@ -374,76 +201,44 @@ async function parseEpgFromStream(url: string): Promise<{ channelCount: number; 
       const desc = rawDesc.length > 250 ? rawDesc.slice(0, 250) + '...' : rawDesc;
       const category = decodeXmlEntities(catMatch ? catMatch[1].trim() : 'ТВ');
 
-      const now = Date.now();
-      const prog: EpgProgram = {
-        id: `epg-${chId}-${start}`,
-        channelId: chId,
-        title,
-        description: desc,
-        category,
-        start,
-        end,
-        isLive: now >= start && now < end,
-        hasArchive: end <= now
-      };
-
-      if (!tempMap.has(chId)) {
-        tempMap.set(chId, []);
-      }
-      tempMap.get(chId)!.push(prog);
-      totalProgrammes++;
+      // Write directly to SQLite staging table batch (flushes every 1,000 rows)
+      writer.addProgram(`epg-${chId}-${start}`, chId, title, category, desc, start, end);
     }
 
-    // Yield to Node.js event loop so incoming TV requests are processed without any delay
+    // Immediately truncate buffer so memory stays below 50 KB!
+    const cut = Math.max(lastChIndex, lastProgIndex);
+    if (cut > 0) {
+      buffer = buffer.slice(cut);
+    } else if (buffer.length > 100000) {
+      const lastClose = buffer.lastIndexOf('</programme>');
+      if (lastClose !== -1) {
+        buffer = buffer.slice(lastClose + 12);
+      }
+    }
+
+    // Yield to Node event loop so requests are served with 0 lag
     await new Promise(resolve => setImmediate(resolve));
-
-    // Progressively merge early channels into main memory so they become immediately queryable
-    if (Date.now() - lastFlushTime > 1500) {
-      for (const [chId, list] of tempMap.entries()) {
-        const existing = programsByChannel.get(chId) || [];
-        const merged = deduplicateEpg([...existing, ...list]);
-        programsByChannel.set(chId, merged);
-      }
-      totalProgrammesCount = totalProgrammes;
-      lastFlushTime = Date.now();
-    }
-
-    // Cut parsed buffer safely to keep memory low
-    const safeCut = Math.max(lastChIndex, lastProgIndex);
-    if (safeCut > 0) {
-      buffer = buffer.slice(safeCut);
-    } else if (buffer.length > 300000) {
-      const lastProgClose = buffer.lastIndexOf('</programme>');
-      if (lastProgClose !== -1) {
-        buffer = buffer.slice(lastProgClose + 12);
-      }
-    }
   }
 
-  // Final merge & deduplication
-  for (const [chId, list] of tempMap.entries()) {
-    const existing = programsByChannel.get(chId) || [];
-    const merged = deduplicateEpg([...existing, ...list]);
-    programsByChannel.set(chId, merged);
-  }
-
-  return { channelCount: tempMap.size, progCount: totalProgrammes };
+  return { progCount: writer.getCurrentCount() };
 }
 
 /**
  * Resilient multi-mirror EPG synchronization.
- * If the primary URL fails or provides no programs, it automatically fails over to backup mirrors.
+ * Streams XMLTV directly into SQLite in micro-transactions, completely avoiding V8 heap OOM.
  */
 export async function syncEpg(customUrl?: string, force = false): Promise<{ success: boolean; channelsCount: number; message: string; mirror: string; fromCache?: boolean }> {
-  // 24-HOUR CACHE RULE: Never re-download if cache is fresh (< 24 hours)
-  if (!force && isCacheFresh()) {
-    const ageHours = ((Date.now() - lastSyncTime) / 3600000).toFixed(1);
-    console.log(`[EPG Service] 24-Hour Cache Active: age is ${ageHours}h, ${totalProgrammesCount} progs across ${programsByChannel.size} channels. Internet download skipped.`);
+  const currentStats = getDatabaseStats();
+
+  // 24-HOUR RULE: Never re-download if SQLite database has fresh data (< 24 hours)
+  if (!force && currentStats.isFresh) {
+    const ageHours = ((Date.now() - currentStats.lastSyncTime) / 3600000).toFixed(1);
+    console.log(`[EPG Service] Суточная база SQLite активна (${currentStats.programsCount} передач, возраст: ${ageHours}ч). Загрузка пропущена.`);
     return {
       success: true,
-      channelsCount: programsByChannel.size,
-      message: `Использован локальный суточный кеш (${totalProgrammesCount} передач для ${programsByChannel.size} каналов)`,
-      mirror: 'local-24h-cache',
+      channelsCount: currentStats.channelsCount,
+      message: `Использована суточная база SQLite (${currentStats.programsCount.toLocaleString()} передач для ${currentStats.channelsCount} каналов)`,
+      mirror: 'sqlite-db',
       fromCache: true
     };
   }
@@ -451,14 +246,14 @@ export async function syncEpg(customUrl?: string, force = false): Promise<{ succ
   if (isSyncing) {
     return {
       success: false,
-      channelsCount: programsByChannel.size,
-      message: 'Синхронизация уже выполняется...',
+      channelsCount: currentStats.channelsCount,
+      message: 'Синхронизация уже выполняется на сервере в фоне...',
       mirror: currentMirrorSource
     };
   }
 
   isSyncing = true;
-  console.log(`[EPG Service] Starting EPG synchronization with resilient mirrors...`);
+  console.log('[EPG Service] Запуск синхронизации EPG напрямую в SQLite...');
 
   const urlsToTry: string[] = [];
   if (customUrl && !urlsToTry.includes(customUrl)) {
@@ -471,215 +266,47 @@ export async function syncEpg(customUrl?: string, force = false): Promise<{ succ
   }
 
   let lastError: Error | null = null;
-  let successMirror = '';
+  const writer = createEpgStreamWriter();
 
   try {
     for (const url of urlsToTry) {
       try {
         currentMirrorSource = url;
-        console.log(`[EPG Service] Attempting sync from mirror: ${url}`);
-        const result = await parseEpgFromStream(url);
+        console.log(`[EPG Service] Попытка синхронизации из зеркала: ${url}`);
+        const result = await parseEpgFromStreamDirectToDb(url, writer);
 
-        if (result.progCount > 0 || programsByChannel.size > 0) {
-          successMirror = url;
-          lastSyncTime = Date.now();
-          totalProgrammesCount = Array.from(programsByChannel.values()).reduce((acc, p) => acc + p.length, 0);
-          console.log(`[EPG Service] Sync SUCCESS via ${url}: indexed ${totalProgrammesCount} programmes across ${programsByChannel.size} channels!`);
+        if (result.progCount >= 500) {
+          // Atomically swap epg_staging into epg_programs
+          const finalCount = writer.finalize(500);
+          console.log(`[EPG Service] Синхронизация УСПЕШНА via ${url}: сохранено ${finalCount.toLocaleString()} передач в SQLite!`);
 
-          // Persist durable cache
-          await persistDurableCache();
-
-          // Atomically write into SQLite database
-          try {
-            const { atomicSaveToDb, getAllChannelsFromDb } = await import('../db/iptvDatabase.ts');
-            const channels = getAllChannelsFromDb();
-            if (channels.length > 0 && programsByChannel.size > 0) {
-              atomicSaveToDb(channels, programsByChannel, channelAliases);
-            }
-          } catch (dbErr) {
-            console.warn('[EPG Service] Notice updating SQLite DB:', dbErr);
-          }
-
+          const updatedStats = getDatabaseStats();
           return {
             success: true,
-            channelsCount: programsByChannel.size,
-            message: `Загружено телегида: ${totalProgrammesCount} передач для ${programsByChannel.size} каналов`,
+            channelsCount: updatedStats.channelsCount,
+            message: `Загружено телегида: ${finalCount.toLocaleString()} передач в SQLite`,
             mirror: url
           };
         }
       } catch (mirrorErr: any) {
-        console.warn(`[EPG Service] Mirror ${url} failed: ${mirrorErr?.message || mirrorErr}. Trying next mirror...`);
+        console.warn(`[EPG Service] Зеркало ${url} вернуло ошибку: ${mirrorErr?.message || mirrorErr}. Пробую следующее зеркало...`);
         lastError = mirrorErr;
       }
     }
 
-    // If all online mirrors failed, but we still have durable cache in memory:
-    if (programsByChannel.size > 0) {
-      return {
-        success: true,
-        channelsCount: programsByChannel.size,
-        message: `Использован долговечный локальный кэш (${programsByChannel.size} каналов)`,
-        mirror: 'local-durable-cache'
-      };
-    }
-
+    writer.abort();
     throw lastError || new Error('Все зеркала EPG недоступны');
   } catch (err: any) {
-    console.error('[EPG Service] Final error syncing EPG across all mirrors:', err);
+    writer.abort();
+    console.error('[EPG Service] Ошибка синхронизации EPG:', err);
+    const stats = getDatabaseStats();
     return {
       success: false,
-      channelsCount: programsByChannel.size,
+      channelsCount: stats.channelsCount,
       message: err.message || 'Ошибка загрузки EPG',
       mirror: 'none'
     };
   } finally {
     isSyncing = false;
   }
-}
-
-/**
- * Ultra-smart channel lookup supporting:
- * - Direct tvgId (ch001, ch1, 1, 442_01, etc.)
- * - Direct channelName & tvgName
- * - Normalized names & stripped suffixes (HD, FHD, UHD, 4K, HDR, 50fps)
- * - Channel aliases extracted from all <display-name> tags and playlist
- */
-export function getChannelEpg(tvgId?: string, channelName?: string, tvgName?: string): EpgProgram[] {
-  // 1. Direct match by tvgId
-  if (tvgId) {
-    if (programsByChannel.has(tvgId)) {
-      return programsByChannel.get(tvgId)!;
-    }
-    const lowerId = tvgId.toLowerCase();
-    if (programsByChannel.has(lowerId)) {
-      return programsByChannel.get(lowerId)!;
-    }
-
-    const aliasByTvgId = channelAliases.get(tvgId) || channelAliases.get(lowerId) || channelAliases.get(normalizeName(tvgId));
-    if (aliasByTvgId && programsByChannel.has(aliasByTvgId)) {
-      return programsByChannel.get(aliasByTvgId)!;
-    }
-
-    // Numeric variations: ch001, ch01, ch1, 1
-    const numMatch = tvgId.match(/\d+/);
-    if (numMatch) {
-      const num = parseInt(numMatch[0], 10);
-      const padded3 = `ch${String(num).padStart(3, '0')}`;
-      const padded2 = `ch${String(num).padStart(2, '0')}`;
-      const unpadded = `ch${num}`;
-      const bareNum = String(num);
-      if (programsByChannel.has(padded3)) return programsByChannel.get(padded3)!;
-      if (programsByChannel.has(padded2)) return programsByChannel.get(padded2)!;
-      if (programsByChannel.has(unpadded)) return programsByChannel.get(unpadded)!;
-      if (programsByChannel.has(bareNum)) return programsByChannel.get(bareNum)!;
-    }
-  }
-
-  // 2. Direct match by tvgName
-  if (tvgName) {
-    if (programsByChannel.has(tvgName)) {
-      return programsByChannel.get(tvgName)!;
-    }
-    const normTvgName = normalizeName(tvgName);
-    const aliasId = channelAliases.get(tvgName) || channelAliases.get(normTvgName);
-    if (aliasId && programsByChannel.has(aliasId)) {
-      return programsByChannel.get(aliasId)!;
-    }
-    const strippedTvgName = normalizeName(stripSuffixes(tvgName));
-    const strippedAliasId = channelAliases.get(strippedTvgName);
-    if (strippedAliasId && programsByChannel.has(strippedAliasId)) {
-      return programsByChannel.get(strippedAliasId)!;
-    }
-  }
-
-  // 3. Match by channelName
-  if (channelName) {
-    if (programsByChannel.has(channelName)) {
-      return programsByChannel.get(channelName)!;
-    }
-
-    const norm = normalizeName(channelName);
-    const mappedId = channelAliases.get(channelName) || channelAliases.get(norm);
-    if (mappedId && programsByChannel.has(mappedId)) {
-      return programsByChannel.get(mappedId)!;
-    }
-
-    // Strip common suffixes (HD, FHD, UHD, HDR, 4K, Double, +2, +4, +6)
-    const strippedNorm = normalizeName(stripSuffixes(channelName));
-    if (strippedNorm && strippedNorm !== norm) {
-      const fallbackId = channelAliases.get(strippedNorm);
-      if (fallbackId && programsByChannel.has(fallbackId)) {
-        return programsByChannel.get(fallbackId)!;
-      }
-    }
-
-    // Substring / fuzzy match across all registered aliases
-    for (const [aliasNorm, id] of channelAliases.entries()) {
-      if (
-        aliasNorm === norm ||
-        aliasNorm === strippedNorm ||
-        (norm.length > 4 && aliasNorm.includes(norm)) ||
-        (aliasNorm.length > 4 && norm.includes(aliasNorm))
-      ) {
-        if (programsByChannel.has(id)) {
-          return programsByChannel.get(id)!;
-        }
-      }
-    }
-  }
-
-  return [];
-}
-
-/**
- * Returns the currently broadcasting live program title for a given channel, or null if not found.
- */
-export function getLiveProgramTitle(tvgId?: string, channelName?: string, tvgName?: string): string | null {
-  const programs = getChannelEpg(tvgId, channelName, tvgName);
-  if (!programs || programs.length === 0) return null;
-
-  const now = Date.now();
-  // 1. Direct match: now is between start and end
-  const current = programs.find(p => p.start <= now && p.end > now);
-  if (current && current.title) return current.title;
-
-  // 2. Tolerance match: program within 15 minutes of now
-  const close = programs.find(p => p.start <= now + 15 * 60000 && p.end >= now - 15 * 60000);
-  if (close && close.title) return close.title;
-
-  return null;
-}
-
-// In-memory cache for batch live programs with 30s TTL
-let cachedBatchLive: { timestamp: number; data: Record<string, string> } | null = null;
-
-/**
- * Fast batch resolution of currently airing live program titles for all provided channels.
- */
-export function getBatchLivePrograms(
-  channels: Array<{ id: string; tvgId?: string; tvgName?: string; name: string }>
-): Record<string, string> {
-  const now = Date.now();
-  if (cachedBatchLive && now - cachedBatchLive.timestamp < 30000 && Object.keys(cachedBatchLive.data).length > 0) {
-    return cachedBatchLive.data;
-  }
-
-  const result: Record<string, string> = {};
-  if (!channels || channels.length === 0) return result;
-
-  for (const ch of channels) {
-    const title = getLiveProgramTitle(ch.tvgId, ch.name, ch.tvgName);
-    if (title) {
-      result[ch.id] = title;
-      result[ch.name] = title;
-      if (ch.tvgId) result[ch.tvgId] = title;
-    }
-  }
-
-  cachedBatchLive = {
-    timestamp: now,
-    data: result
-  };
-
-  return result;
 }
