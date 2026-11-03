@@ -625,7 +625,18 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
 
       const now = Date.now();
       let targetIdx = 0;
-      if (selectedDayOffset === 0) {
+      if (isArchiveMode && currentPlayingProgram) {
+        // If watching from archive, keep focus on the active archive program
+        const archiveIdx = filteredEpg.findIndex(
+          p => p.id === currentPlayingProgram.id || (p.start <= seekTimestamp && p.end > seekTimestamp)
+        );
+        if (archiveIdx !== -1) {
+          targetIdx = archiveIdx;
+        } else if (selectedDayOffset === 0) {
+          const liveIdx = filteredEpg.findIndex(p => p.isLive || (p.start <= now && p.end > now));
+          targetIdx = liveIdx !== -1 ? liveIdx : 0;
+        }
+      } else if (selectedDayOffset === 0) {
         const liveIdx = filteredEpg.findIndex(p => p.isLive || (p.start <= now && p.end > now));
         if (liveIdx !== -1) {
           targetIdx = liveIdx;
@@ -642,7 +653,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         alignEpgList(false, targetIdx);
       }, 40);
     }
-  }, [overlayMode, selectedDayOffset, selectedChannel?.id, filteredEpg.length, alignEpgList]);
+  }, [overlayMode, selectedDayOffset, selectedChannel?.id, filteredEpg.length, isArchiveMode, currentPlayingProgram, seekTimestamp, alignEpgList]);
 
   // Get accurate current wall-clock playback timestamp (especially during archive playback)
   const getCurrentPlaybackTimestamp = useCallback((): number => {
@@ -1198,32 +1209,44 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           case 'GUIDE':
             if (filteredChannels[focusedChannelIndex]) {
               const ch = filteredChannels[focusedChannelIndex];
-              setIsArchiveMode(false);
-              archiveBaseTimestampRef.current = 0;
-              currentArchivePlaybackTimeRef.current = 0;
-              setIsStalled(false);
-              setReconnectAttempt(0);
-              setPlayerError(null);
-              setSelectedChannel(ch);
-              setSelectedDayOffset(0);
-              playStream(ch.streamUrl, false);
-              setOverlayMode('epg');
+              const isCurrent = selectedChannel && (selectedChannel.id === ch.id || selectedChannel.streamUrl === ch.streamUrl);
+              if (isCurrent) {
+                // If channel is already playing, do NOT reload stream and do NOT reset archive!
+                setOverlayMode('epg');
+              } else {
+                setIsArchiveMode(false);
+                archiveBaseTimestampRef.current = 0;
+                currentArchivePlaybackTimeRef.current = 0;
+                setIsStalled(false);
+                setReconnectAttempt(0);
+                setPlayerError(null);
+                setSelectedChannel(ch);
+                setSelectedDayOffset(0);
+                playStream(ch.streamUrl, false);
+                setOverlayMode('epg');
+              }
             }
             break;
 
           case 'PLAY_PAUSE':
             if (filteredChannels[focusedChannelIndex]) {
               const ch = filteredChannels[focusedChannelIndex];
-              setIsArchiveMode(false);
-              archiveBaseTimestampRef.current = 0;
-              currentArchivePlaybackTimeRef.current = 0;
-              setIsStalled(false);
-              setReconnectAttempt(0);
-              setPlayerError(null);
-              setSelectedChannel(ch);
-              setSelectedDayOffset(0);
-              playStream(ch.streamUrl, false);
-              setOverlayMode('none');
+              const isCurrent = selectedChannel && (selectedChannel.id === ch.id || selectedChannel.streamUrl === ch.streamUrl);
+              if (isCurrent) {
+                // If already playing this channel, simply return to full-screen video
+                setOverlayMode('none');
+              } else {
+                setIsArchiveMode(false);
+                archiveBaseTimestampRef.current = 0;
+                currentArchivePlaybackTimeRef.current = 0;
+                setIsStalled(false);
+                setReconnectAttempt(0);
+                setPlayerError(null);
+                setSelectedChannel(ch);
+                setSelectedDayOffset(0);
+                playStream(ch.streamUrl, false);
+                setOverlayMode('none');
+              }
             }
             break;
 
@@ -1866,6 +1889,13 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                     key={channel.id || actualIndex}
                     id={`ch-item-${actualIndex}`}
                     onClick={() => {
+                      setFocusedChannelIndex(actualIndex);
+                      const isCurrent = selectedChannel && (selectedChannel.id === channel.id || selectedChannel.streamUrl === channel.streamUrl);
+                      if (isCurrent) {
+                        // Already watching this channel: do NOT reload stream or reset archive playback!
+                        setOverlayMode('epg');
+                        return;
+                      }
                       setIsArchiveMode(false);
                       archiveBaseTimestampRef.current = 0;
                       currentArchivePlaybackTimeRef.current = 0;
@@ -1874,11 +1904,17 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                       setPlayerError(null);
                       setSelectedChannel(channel);
                       playStream(channel.streamUrl, false);
-                      setFocusedChannelIndex(actualIndex);
                       setSelectedDayOffset(0);
                       setOverlayMode('epg');
                     }}
                     onDoubleClick={() => {
+                      setFocusedChannelIndex(actualIndex);
+                      const isCurrent = selectedChannel && (selectedChannel.id === channel.id || selectedChannel.streamUrl === channel.streamUrl);
+                      if (isCurrent) {
+                        // Already watching this channel: return to full-screen view
+                        setOverlayMode('none');
+                        return;
+                      }
                       setIsArchiveMode(false);
                       archiveBaseTimestampRef.current = 0;
                       currentArchivePlaybackTimeRef.current = 0;
@@ -1887,7 +1923,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                       setPlayerError(null);
                       setSelectedChannel(channel);
                       playStream(channel.streamUrl, false);
-                      setFocusedChannelIndex(actualIndex);
                       setSelectedDayOffset(0);
                       setOverlayMode('none');
                     }}
@@ -2011,6 +2046,12 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                         title="Программа передач (EPG)"
                         onClick={(e) => {
                           e.stopPropagation();
+                          const isCurrent = selectedChannel && (selectedChannel.id === channel.id || selectedChannel.streamUrl === channel.streamUrl);
+                          if (isCurrent) {
+                            // Already watching this channel: do NOT reload stream or reset archive!
+                            setOverlayMode('epg');
+                            return;
+                          }
                           setSelectedChannel(channel);
                           setSelectedDayOffset(0);
                           setOverlayMode('epg');
