@@ -412,6 +412,21 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   }, [CHANNEL_ITEM_HEIGHT]);
 
   // Helper: center focused program item
+  // Robust channel equality helper (matches by ID, name, tvgId, or base stream URL)
+  const isSameChannel = useCallback((a: Channel | null | undefined, b: Channel | null | undefined): boolean => {
+    if (!a || !b) return false;
+    if (a.id && b.id && a.id === b.id) return true;
+    if (a.name && b.name && a.name.trim().toLowerCase() === b.name.trim().toLowerCase()) return true;
+    if (a.tvgId && b.tvgId && a.tvgId.trim().toLowerCase() === b.tvgId.trim().toLowerCase()) return true;
+    if (a.streamUrl && b.streamUrl) {
+      const cleanA = a.streamUrl.split('?')[0].replace(/\/+$/, '');
+      const cleanB = b.streamUrl.split('?')[0].replace(/\/+$/, '');
+      if (cleanA === cleanB) return true;
+    }
+    return false;
+  }, []);
+
+  // Helper: center focused program item
   const alignEpgList = useCallback((smooth = false, progIdx?: number) => {
     const container = epgListRef.current;
     if (!container) return;
@@ -424,6 +439,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       } else {
         container.scrollTop = targetTop;
       }
+    } else if (targetIdx === 0) {
+      container.scrollTop = 0;
     }
   }, []);
 
@@ -608,6 +625,14 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }
   }, [focusedProgramIndex, overlayMode, alignEpgList]);
 
+  // Reset EPG scroll position immediately when switching channels
+  useEffect(() => {
+    if (epgListRef.current) {
+      epgListRef.current.scrollTop = 0;
+    }
+    lastEpgFocusKeyRef.current = '';
+  }, [selectedChannel?.id]);
+
   // Clear lastEpgFocusKeyRef when exiting EPG overlay so re-opening it will re-focus the live program
   useEffect(() => {
     if (overlayMode !== 'epg') {
@@ -651,9 +676,22 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       setFocusedProgramIndex(targetIdx);
       setTimeout(() => {
         alignEpgList(false, targetIdx);
-      }, 40);
+      }, 50);
     }
   }, [overlayMode, selectedDayOffset, selectedChannel?.id, filteredEpg.length, isArchiveMode, currentPlayingProgram, seekTimestamp, alignEpgList]);
+
+  // Guarantee EPG scroll auto-centers on active program once programs finish loading and rendering in DOM
+  useEffect(() => {
+    if (overlayMode === 'epg' && !isLoadingEpg && filteredEpg.length > 0) {
+      const idx = focusedProgramIndex;
+      const t1 = setTimeout(() => alignEpgList(false, idx), 40);
+      const t2 = setTimeout(() => alignEpgList(false, idx), 150);
+      return () => {
+        clearTimeout(t1);
+        clearTimeout(t2);
+      };
+    }
+  }, [filteredEpg.length, isLoadingEpg, overlayMode, focusedProgramIndex, alignEpgList]);
 
   // Get accurate current wall-clock playback timestamp (especially during archive playback)
   const getCurrentPlaybackTimestamp = useCallback((): number => {
@@ -909,10 +947,15 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     return () => clearInterval(interval);
   }, [isLoadingStream, playerError, isStalled, handleRecoverStream]);
 
-  // Play channel live stream on channel change
+  const lastPlayedStreamUrlRef = useRef<string>('');
+
+  // Play channel live stream on channel change (only if streamUrl actually changed)
   useEffect(() => {
     if (selectedChannel && !isArchiveMode) {
-      playStream(selectedChannel.streamUrl);
+      if (lastPlayedStreamUrlRef.current !== selectedChannel.streamUrl) {
+        lastPlayedStreamUrlRef.current = selectedChannel.streamUrl;
+        playStream(selectedChannel.streamUrl);
+      }
     }
   }, [selectedChannel, isArchiveMode, playStream]);
 
@@ -1209,8 +1252,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           case 'GUIDE':
             if (filteredChannels[focusedChannelIndex]) {
               const ch = filteredChannels[focusedChannelIndex];
-              const isCurrent = selectedChannel && (selectedChannel.id === ch.id || selectedChannel.streamUrl === ch.streamUrl);
-              if (isCurrent) {
+              if (isSameChannel(selectedChannel, ch)) {
                 // If channel is already playing, do NOT reload stream and do NOT reset archive!
                 setOverlayMode('epg');
               } else {
@@ -1231,8 +1273,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           case 'PLAY_PAUSE':
             if (filteredChannels[focusedChannelIndex]) {
               const ch = filteredChannels[focusedChannelIndex];
-              const isCurrent = selectedChannel && (selectedChannel.id === ch.id || selectedChannel.streamUrl === ch.streamUrl);
-              if (isCurrent) {
+              if (isSameChannel(selectedChannel, ch)) {
                 // If already playing this channel, simply return to full-screen video
                 setOverlayMode('none');
               } else {
@@ -1881,7 +1922,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               }}
             >
               {visibleChannels.map(({ channel, actualIndex }) => {
-                const isSelected = selectedChannel?.id === channel.id;
+                const isSelected = isSameChannel(selectedChannel, channel);
                 const isFocused = focusedChannelIndex === actualIndex;
 
                 return (
@@ -1890,8 +1931,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                     id={`ch-item-${actualIndex}`}
                     onClick={() => {
                       setFocusedChannelIndex(actualIndex);
-                      const isCurrent = selectedChannel && (selectedChannel.id === channel.id || selectedChannel.streamUrl === channel.streamUrl);
-                      if (isCurrent) {
+                      if (isSameChannel(selectedChannel, channel)) {
                         // Already watching this channel: do NOT reload stream or reset archive playback!
                         setOverlayMode('epg');
                         return;
@@ -1909,8 +1949,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                     }}
                     onDoubleClick={() => {
                       setFocusedChannelIndex(actualIndex);
-                      const isCurrent = selectedChannel && (selectedChannel.id === channel.id || selectedChannel.streamUrl === channel.streamUrl);
-                      if (isCurrent) {
+                      if (isSameChannel(selectedChannel, channel)) {
                         // Already watching this channel: return to full-screen view
                         setOverlayMode('none');
                         return;
@@ -2046,8 +2085,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                         title="Программа передач (EPG)"
                         onClick={(e) => {
                           e.stopPropagation();
-                          const isCurrent = selectedChannel && (selectedChannel.id === channel.id || selectedChannel.streamUrl === channel.streamUrl);
-                          if (isCurrent) {
+                          if (isSameChannel(selectedChannel, channel)) {
                             // Already watching this channel: do NOT reload stream or reset archive!
                             setOverlayMode('epg');
                             return;
