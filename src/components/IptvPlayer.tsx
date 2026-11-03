@@ -427,30 +427,25 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     return false;
   }, []);
 
-  // Helper: center focused program item with mathematically exact bounding rect calculation & scrollIntoView
+  // Helper: center focused program item with mathematically exact bounding rect calculation
   const alignEpgList = useCallback((smooth = false, progIdx?: number) => {
     const container = epgListRef.current;
     if (!container) return;
     const targetIdx = progIdx !== undefined ? progIdx : focusedProgramIndexRef.current;
     const itemEl = document.getElementById(`epg-item-${targetIdx}`);
     if (itemEl) {
-      try {
-        itemEl.scrollIntoView({
-          behavior: smooth ? 'smooth' : 'auto',
-          block: 'center',
-          inline: 'nearest'
-        });
-      } catch {
-        // Fallback for older Smart TV webviews
-        const itemRect = itemEl.getBoundingClientRect();
-        const containerRect = container.getBoundingClientRect();
-        const relativeTop = (itemRect.top - containerRect.top) + container.scrollTop;
-        const targetTop = Math.max(0, relativeTop - (container.clientHeight / 2) + (itemRect.height / 2));
-        if (smooth) {
+      const itemRect = itemEl.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+      const relativeTop = (itemRect.top - containerRect.top) + container.scrollTop;
+      const targetTop = Math.max(0, Math.round(relativeTop - (container.clientHeight / 2) + (itemRect.height / 2)));
+      if (smooth) {
+        try {
           container.scrollTo({ top: targetTop, behavior: 'smooth' });
-        } else {
+        } catch {
           container.scrollTop = targetTop;
         }
+      } else {
+        container.scrollTop = targetTop;
       }
     } else if (targetIdx === 0) {
       container.scrollTop = 0;
@@ -693,12 +688,16 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
 
       const doCenter = () => alignEpgList(false, targetIdx);
       doCenter();
-      const r1 = requestAnimationFrame(doCenter);
-      const t1 = setTimeout(doCenter, 30);
-      const t2 = setTimeout(doCenter, 100);
+      let r2 = 0;
+      const r1 = requestAnimationFrame(() => {
+        r2 = requestAnimationFrame(doCenter);
+      });
+      const t1 = setTimeout(doCenter, 40);
+      const t2 = setTimeout(doCenter, 120);
 
       return () => {
         cancelAnimationFrame(r1);
+        cancelAnimationFrame(r2);
         clearTimeout(t1);
         clearTimeout(t2);
       };
