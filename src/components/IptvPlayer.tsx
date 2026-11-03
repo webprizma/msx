@@ -176,6 +176,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   focusedProgramIndexRef.current = focusedProgramIndex;
 
   const lastEpgFocusKeyRef = useRef<string>('');
+  const lastPlayedStreamUrlRef = useRef<string>('');
 
   // Auto-hide bottom hint after 3 seconds of inactivity
   const pokeBottomHint = useCallback(() => {
@@ -426,18 +427,30 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     return false;
   }, []);
 
-  // Helper: center focused program item
+  // Helper: center focused program item with mathematically exact bounding rect calculation & scrollIntoView
   const alignEpgList = useCallback((smooth = false, progIdx?: number) => {
     const container = epgListRef.current;
     if (!container) return;
     const targetIdx = progIdx !== undefined ? progIdx : focusedProgramIndexRef.current;
     const itemEl = document.getElementById(`epg-item-${targetIdx}`);
     if (itemEl) {
-      const targetTop = Math.max(0, itemEl.offsetTop - (container.clientHeight / 2) + (itemEl.clientHeight / 2));
-      if (smooth) {
-        container.scrollTo({ top: targetTop, behavior: 'smooth' });
-      } else {
-        container.scrollTop = targetTop;
+      try {
+        itemEl.scrollIntoView({
+          behavior: smooth ? 'smooth' : 'auto',
+          block: 'center',
+          inline: 'nearest'
+        });
+      } catch {
+        // Fallback for older Smart TV webviews
+        const itemRect = itemEl.getBoundingClientRect();
+        const containerRect = container.getBoundingClientRect();
+        const relativeTop = (itemRect.top - containerRect.top) + container.scrollTop;
+        const targetTop = Math.max(0, relativeTop - (container.clientHeight / 2) + (itemRect.height / 2));
+        if (smooth) {
+          container.scrollTo({ top: targetTop, behavior: 'smooth' });
+        } else {
+          container.scrollTop = targetTop;
+        }
       }
     } else if (targetIdx === 0) {
       container.scrollTop = 0;
@@ -462,11 +475,12 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           hasArchive: p.end <= now
         }));
         setEpgList(programs);
-        const liveProg = programs.find(p => p.isLive) || programs.find(p => p.end <= now) || programs[0];
-        setCurrentPlayingProgram(liveProg);
-        setActiveTimelineProgram(liveProg);
-        setSeekTimestamp(now);
-        setIsArchiveMode(false);
+        if (!isArchiveMode) {
+          const liveProg = programs.find(p => p.isLive) || programs.find(p => p.end <= now) || programs[0];
+          setCurrentPlayingProgram(liveProg);
+          setActiveTimelineProgram(liveProg);
+          setSeekTimestamp(now);
+        }
         setIsLoadingEpg(false);
         return;
       }
@@ -495,56 +509,60 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             }));
             setEpgList(programs);
 
-            const liveProg = programs.find(p => p.isLive) || programs.find(p => p.end <= now) || programs[0];
-            setCurrentPlayingProgram(liveProg);
-            setActiveTimelineProgram(liveProg);
-            setSeekTimestamp(now);
-            setIsArchiveMode(false);
+            if (!isArchiveMode) {
+              const liveProg = programs.find(p => p.isLive) || programs.find(p => p.end <= now) || programs[0];
+              setCurrentPlayingProgram(liveProg);
+              setActiveTimelineProgram(liveProg);
+              setSeekTimestamp(now);
+            }
             setIsLoadingEpg(false);
 
             // Auto-check: if no programs overlap current selectedDayOffset, align to closest day with programs
-            const tzOffsetMs = 3 * 3600 * 1000;
-            const nowInMsk = new Date(Date.now() + tzOffsetMs);
-            const hasProgramsForCurrentDay = programs.some(p => {
-              const targetInMsk = new Date(nowInMsk);
-              targetInMsk.setUTCDate(targetInMsk.getUTCDate() + selectedDayOffset);
-              targetInMsk.setUTCHours(0, 0, 0, 0);
-              const start = targetInMsk.getTime() - tzOffsetMs;
-              const end = start + 24 * 3600 * 1000;
-              return p.end > start && p.start < end;
-            });
-
-            if (!hasProgramsForCurrentDay) {
-              for (const off of [0, -1, 1, -2, -3, -4, -5, -6, -7]) {
+            if (!isArchiveMode) {
+              const tzOffsetMs = 3 * 3600 * 1000;
+              const nowInMsk = new Date(Date.now() + tzOffsetMs);
+              const hasProgramsForCurrentDay = programs.some(p => {
                 const targetInMsk = new Date(nowInMsk);
-                targetInMsk.setUTCDate(targetInMsk.getUTCDate() + off);
+                targetInMsk.setUTCDate(targetInMsk.getUTCDate() + selectedDayOffset);
                 targetInMsk.setUTCHours(0, 0, 0, 0);
-                const s = targetInMsk.getTime() - tzOffsetMs;
-                const e = s + 24 * 3600 * 1000;
-                if (programs.some(p => p.end > s && p.start < e)) {
-                  setSelectedDayOffset(off);
-                  break;
+                const start = targetInMsk.getTime() - tzOffsetMs;
+                const end = start + 24 * 3600 * 1000;
+                return p.end > start && p.start < end;
+              });
+
+              if (!hasProgramsForCurrentDay) {
+                for (const off of [0, -1, 1, -2, -3, -4, -5, -6, -7]) {
+                  const targetInMsk = new Date(nowInMsk);
+                  targetInMsk.setUTCDate(targetInMsk.getUTCDate() + off);
+                  targetInMsk.setUTCHours(0, 0, 0, 0);
+                  const s = targetInMsk.getTime() - tzOffsetMs;
+                  const e = s + 24 * 3600 * 1000;
+                  if (programs.some(p => p.end > s && p.start < e)) {
+                    setSelectedDayOffset(off);
+                    break;
+                  }
                 }
               }
             }
           } else {
             // No EPG returned yet — keep list empty and show fallback live, do NOT lock cache
             setEpgList([]);
-            const fallbackLive: EpgProgram = {
-              id: `live-${selectedChannel.id}`,
-              channelId: selectedChannel.id,
-              title: selectedChannel.name,
-              description: 'Прямой эфир телеканала',
-              category: selectedChannel.group || 'ТВ',
-              start: now - 3600000,
-              end: now + 3600000,
-              isLive: true,
-              hasArchive: false
-            };
-            setCurrentPlayingProgram(fallbackLive);
-            setActiveTimelineProgram(fallbackLive);
-            setSeekTimestamp(now);
-            setIsArchiveMode(false);
+            if (!isArchiveMode) {
+              const fallbackLive: EpgProgram = {
+                id: `live-${selectedChannel.id}`,
+                channelId: selectedChannel.id,
+                title: selectedChannel.name,
+                description: 'Прямой эфир телеканала',
+                category: selectedChannel.group || 'ТВ',
+                start: now - 3600000,
+                end: now + 3600000,
+                isLive: true,
+                hasArchive: false
+              };
+              setCurrentPlayingProgram(fallbackLive);
+              setActiveTimelineProgram(fallbackLive);
+              setSeekTimestamp(now);
+            }
             setIsLoadingEpg(false);
           }
         })
@@ -560,7 +578,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     return () => {
       isCancelled = true;
     };
-  }, [selectedChannel?.id, epgReloadKey]);
+  }, [selectedChannel?.id, epgReloadKey, isArchiveMode]);
 
   // INSTANT AUTO-ALIGNMENT ON OVERLAY OPEN
   useEffect(() => {
@@ -640,58 +658,52 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }
   }, [overlayMode]);
 
-  // When opening EPG overlay or changing date/channel, auto-focus current live/first program ONCE
-  useEffect(() => {
-    if (overlayMode !== 'epg' || filteredEpg.length === 0) return;
+  // Calculate the target program index (current playing archive program or current live program)
+  const getTargetProgramIndex = useCallback((): number => {
+    if (filteredEpg.length === 0) return 0;
+    const now = Date.now();
 
-    const currentKey = `${selectedChannel?.id}_${selectedDayOffset}`;
+    if (isArchiveMode && currentPlayingProgram) {
+      const archiveIdx = filteredEpg.findIndex(
+        p => p.id === currentPlayingProgram.id || (p.start <= seekTimestamp && p.end > seekTimestamp)
+      );
+      if (archiveIdx !== -1) return archiveIdx;
+    }
+
+    if (selectedDayOffset === 0) {
+      const liveIdx = filteredEpg.findIndex(p => p.isLive || (p.start <= now && p.end > now));
+      if (liveIdx !== -1) return liveIdx;
+      const upcomingIdx = filteredEpg.findIndex(p => p.start >= now);
+      if (upcomingIdx !== -1) return upcomingIdx;
+    }
+
+    return 0;
+  }, [filteredEpg, isArchiveMode, currentPlayingProgram, seekTimestamp, selectedDayOffset]);
+
+  // When opening EPG overlay, switching channels, or changing date, immediately focus & center the active program
+  useEffect(() => {
+    if (overlayMode !== 'epg' || filteredEpg.length === 0 || isLoadingEpg) return;
+
+    const currentKey = `${selectedChannel?.id}_${selectedDayOffset}_${filteredEpg.length}`;
     if (lastEpgFocusKeyRef.current !== currentKey) {
       lastEpgFocusKeyRef.current = currentKey;
 
-      const now = Date.now();
-      let targetIdx = 0;
-      if (isArchiveMode && currentPlayingProgram) {
-        // If watching from archive, keep focus on the active archive program
-        const archiveIdx = filteredEpg.findIndex(
-          p => p.id === currentPlayingProgram.id || (p.start <= seekTimestamp && p.end > seekTimestamp)
-        );
-        if (archiveIdx !== -1) {
-          targetIdx = archiveIdx;
-        } else if (selectedDayOffset === 0) {
-          const liveIdx = filteredEpg.findIndex(p => p.isLive || (p.start <= now && p.end > now));
-          targetIdx = liveIdx !== -1 ? liveIdx : 0;
-        }
-      } else if (selectedDayOffset === 0) {
-        const liveIdx = filteredEpg.findIndex(p => p.isLive || (p.start <= now && p.end > now));
-        if (liveIdx !== -1) {
-          targetIdx = liveIdx;
-        } else {
-          const upcomingIdx = filteredEpg.findIndex(p => p.start >= now);
-          targetIdx = upcomingIdx !== -1 ? upcomingIdx : 0;
-        }
-      } else {
-        targetIdx = 0;
-      }
-
+      const targetIdx = getTargetProgramIndex();
       setFocusedProgramIndex(targetIdx);
-      setTimeout(() => {
-        alignEpgList(false, targetIdx);
-      }, 50);
-    }
-  }, [overlayMode, selectedDayOffset, selectedChannel?.id, filteredEpg.length, isArchiveMode, currentPlayingProgram, seekTimestamp, alignEpgList]);
 
-  // Guarantee EPG scroll auto-centers on active program once programs finish loading and rendering in DOM
-  useEffect(() => {
-    if (overlayMode === 'epg' && !isLoadingEpg && filteredEpg.length > 0) {
-      const idx = focusedProgramIndex;
-      const t1 = setTimeout(() => alignEpgList(false, idx), 40);
-      const t2 = setTimeout(() => alignEpgList(false, idx), 150);
+      const doCenter = () => alignEpgList(false, targetIdx);
+      doCenter();
+      const r1 = requestAnimationFrame(doCenter);
+      const t1 = setTimeout(doCenter, 30);
+      const t2 = setTimeout(doCenter, 100);
+
       return () => {
+        cancelAnimationFrame(r1);
         clearTimeout(t1);
         clearTimeout(t2);
       };
     }
-  }, [filteredEpg.length, isLoadingEpg, overlayMode, focusedProgramIndex, alignEpgList]);
+  }, [overlayMode, selectedChannel?.id, selectedDayOffset, filteredEpg.length, isLoadingEpg, getTargetProgramIndex, alignEpgList]);
 
   // Get accurate current wall-clock playback timestamp (especially during archive playback)
   const getCurrentPlaybackTimestamp = useCallback((): number => {
@@ -725,6 +737,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
 
   // Stream Playback Handler with HLS.js (Adaptive buffer cache for Archive vs Live)
   const playStream = useCallback((streamUrl: string, forceArchive?: boolean) => {
+    lastPlayedStreamUrlRef.current = streamUrl;
     setPlayerError(null);
     setIsLoadingStream(true);
     setIsStalled(false);
@@ -947,9 +960,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     return () => clearInterval(interval);
   }, [isLoadingStream, playerError, isStalled, handleRecoverStream]);
 
-  const lastPlayedStreamUrlRef = useRef<string>('');
-
-  // Play channel live stream on channel change (only if streamUrl actually changed)
+  // Play channel live stream on channel change (only if streamUrl actually changed and not in archive mode)
   useEffect(() => {
     if (selectedChannel && !isArchiveMode) {
       if (lastPlayedStreamUrlRef.current !== selectedChannel.streamUrl) {
@@ -957,7 +968,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
         playStream(selectedChannel.streamUrl);
       }
     }
-  }, [selectedChannel, isArchiveMode, playStream]);
+  }, [selectedChannel?.id, selectedChannel?.streamUrl, isArchiveMode, playStream]);
 
   // Play Archive from a specific program
   const handlePlayArchiveProgram = useCallback((program: EpgProgram, fromStart = true) => {
@@ -1330,11 +1341,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           case 'OK':
             if (filteredEpg.length === 0) {
               handleForceReloadEpg();
-              if (selectedChannel) {
-                setIsArchiveMode(false);
-                archiveBaseTimestampRef.current = 0;
-                playStream(selectedChannel.streamUrl, false);
-              }
               break;
             }
             if (filteredEpg[focusedProgramIndex]) {
@@ -2054,6 +2060,10 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                         title="Включить прямой эфир на весь экран"
                         onClick={(e) => {
                           e.stopPropagation();
+                          if (isSameChannel(selectedChannel, channel) && !isArchiveMode) {
+                            setOverlayMode('none');
+                            return;
+                          }
                           setIsArchiveMode(false);
                           archiveBaseTimestampRef.current = 0;
                           currentArchivePlaybackTimeRef.current = 0;
