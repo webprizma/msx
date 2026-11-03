@@ -2337,8 +2337,12 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             ) : (
               filteredEpg.map((prog, idx) => {
                 const isFocused = focusedProgramIndex === idx;
-                const isCurrentLive = prog.isLive;
                 const isFuture = prog.start > Date.now();
+                const isCurrentlyPlaying = isArchiveMode
+                  ? (currentPlayingProgram?.id === prog.id ||
+                     (prog.start <= seekTimestamp && prog.end > seekTimestamp) ||
+                     (currentPlayingProgram && prog.title === currentPlayingProgram.title && prog.start === currentPlayingProgram.start))
+                  : (prog.isLive || (Date.now() >= prog.start && Date.now() < prog.end));
 
                 return (
                   <div
@@ -2364,68 +2368,100 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                       cursor: isFuture ? 'not-allowed' : 'pointer',
                       backgroundColor: isFocused
                         ? '#0284c7'
-                        : isCurrentLive
-                        ? 'rgba(12, 74, 110, 0.6)'
+                        : isCurrentlyPlaying
+                        ? 'rgba(12, 74, 110, 0.65)'
                         : isFuture
                         ? 'rgba(15, 23, 42, 0.4)'
                         : 'rgba(17, 24, 39, 0.6)',
-                      color: isFuture && !isFocused ? '#64748b' : '#ffffff',
+                      color: isFuture && !isFocused && !isCurrentlyPlaying ? '#64748b' : '#ffffff',
                       border: isFocused
                         ? '3px solid #38bdf8'
-                        : isCurrentLive
-                        ? '1px solid rgba(56, 189, 248, 0.6)'
+                        : isCurrentlyPlaying
+                        ? '1.5px solid rgba(56, 189, 248, 0.85)'
                         : '1px solid rgba(51, 65, 85, 0.5)',
-                      boxShadow: isFocused ? '0 0 15px rgba(56, 189, 248, 0.5)' : 'none',
-                      opacity: isFuture && !isFocused ? 0.65 : 1.0
+                      boxShadow: isFocused
+                        ? '0 0 16px rgba(56, 189, 248, 0.6)'
+                        : isCurrentlyPlaying
+                        ? '0 0 12px rgba(56, 189, 248, 0.25)'
+                        : 'none',
+                      opacity: isFuture && !isFocused && !isCurrentlyPlaying ? 0.65 : 1.0,
+                      transition: 'background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease'
                     }}
                   >
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-                      <span style={{ fontSize: '11px', fontFamily: 'monospace', fontWeight: 'bold', color: isFocused ? '#ffffff' : isFuture ? '#64748b' : '#38bdf8' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px', gap: '8px' }}>
+                      <span style={{
+                        fontSize: '11px',
+                        fontFamily: 'monospace',
+                        fontWeight: 'bold',
+                        color: isFocused ? '#ffffff' : isCurrentlyPlaying ? '#38bdf8' : isFuture ? '#64748b' : '#94a3b8'
+                      }}>
                         {formatTime(prog.start)} — {formatTime(prog.end)}
                       </span>
 
-                      {prog.isLive ? (
-                        <span
-                          style={{
-                            fontSize: '10px',
-                            fontWeight: 'bold',
-                            padding: '2px 6px',
-                            borderRadius: '8px',
-                            backgroundColor: 'rgba(239, 68, 68, 0.3)',
-                            color: '#f87171',
-                            border: '1px solid rgba(239, 68, 68, 0.5)'
-                          }}
-                        >
-                          ● ЭФИР
-                        </span>
-                      ) : isFuture ? (
-                        <span
-                          style={{
-                            fontSize: '10px',
-                            fontWeight: 'bold',
-                            padding: '2px 6px',
-                            borderRadius: '8px',
-                            backgroundColor: 'rgba(71, 85, 105, 0.3)',
-                            color: '#94a3b8'
-                          }}
-                        >
-                          СКОРО
-                        </span>
-                      ) : prog.hasArchive ? (
-                        <span
-                          style={{
-                            fontSize: '10px',
-                            fontWeight: 'bold',
-                            padding: '2px 6px',
-                            borderRadius: '8px',
-                            backgroundColor: 'rgba(245, 158, 11, 0.25)',
-                            color: '#fbbf24',
-                            border: '1px solid rgba(245, 158, 11, 0.4)'
-                          }}
-                        >
-                          АРХИВ
-                        </span>
-                      ) : null}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        {isCurrentlyPlaying && (
+                          <span
+                            style={{
+                              fontSize: '10px',
+                              fontWeight: 'bold',
+                              padding: '2px 6px',
+                              borderRadius: '8px',
+                              backgroundColor: isFocused ? 'rgba(255, 255, 255, 0.25)' : 'rgba(14, 165, 233, 0.3)',
+                              color: isFocused ? '#ffffff' : '#38bdf8',
+                              border: `1px solid ${isFocused ? 'rgba(255, 255, 255, 0.5)' : 'rgba(56, 189, 248, 0.6)'}`,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '4px'
+                            }}
+                          >
+                            <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: isFocused ? '#ffffff' : '#38bdf8' }} />
+                            ИГРАЕТ
+                          </span>
+                        )}
+
+                        {prog.isLive ? (
+                          <span
+                            style={{
+                              fontSize: '10px',
+                              fontWeight: 'bold',
+                              padding: '2px 6px',
+                              borderRadius: '8px',
+                              backgroundColor: isCurrentlyPlaying ? 'rgba(239, 68, 68, 0.35)' : 'rgba(239, 68, 68, 0.18)',
+                              color: '#f87171',
+                              border: '1px solid rgba(239, 68, 68, 0.45)'
+                            }}
+                          >
+                            ● ЭФИР
+                          </span>
+                        ) : isFuture ? (
+                          <span
+                            style={{
+                              fontSize: '10px',
+                              fontWeight: 'bold',
+                              padding: '2px 6px',
+                              borderRadius: '8px',
+                              backgroundColor: 'rgba(71, 85, 105, 0.3)',
+                              color: '#94a3b8'
+                            }}
+                          >
+                            СКОРО
+                          </span>
+                        ) : prog.hasArchive ? (
+                          <span
+                            style={{
+                              fontSize: '10px',
+                              fontWeight: 'bold',
+                              padding: '2px 6px',
+                              borderRadius: '8px',
+                              backgroundColor: 'rgba(245, 158, 11, 0.25)',
+                              color: '#fbbf24',
+                              border: '1px solid rgba(245, 158, 11, 0.4)'
+                            }}
+                          >
+                            АРХИВ
+                          </span>
+                        ) : null}
+                      </div>
                     </div>
 
                     <h3 style={{ fontSize: '13px', fontWeight: 'bold', margin: '0 0 3px 0', lineHeight: 1.3 }}>
@@ -2433,7 +2469,16 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                     </h3>
 
                     {prog.description && (
-                      <p style={{ fontSize: '11px', color: isFocused ? '#bae6fd' : '#94a3b8', margin: 0, lineHeight: 1.3, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                      <p style={{
+                        fontSize: '11px',
+                        color: isFocused ? '#bae6fd' : isCurrentlyPlaying ? '#e0f2fe' : '#94a3b8',
+                        margin: 0,
+                        lineHeight: 1.3,
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden'
+                      }}>
                         {prog.description}
                       </p>
                     )}
