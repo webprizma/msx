@@ -213,7 +213,7 @@ export const IptvDbViewer: React.FC = () => {
               className="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs outline-none focus:border-sky-400 transition-all font-sans"
             >
               <option value="">Все каналы в базе ({channels.length || '1 341'})</option>
-              {filteredChannelOptions.slice(0, 300).map((ch) => (
+              {filteredChannelOptions.map((ch) => (
                 <option key={ch.id} value={ch.id}>
                   {ch.name} {ch.tvgId ? `(${ch.tvgId})` : ''} — {ch.group || 'Общие'}
                 </option>

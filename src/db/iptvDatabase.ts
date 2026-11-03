@@ -218,48 +218,86 @@ export function saveChannelsToDb(channels: Channel[]): void {
 }
 
 /**
- * Resolves canonical channel ID through SQLite aliases (normalized names, tvg-id, etc.)
+ * Resolves the channel identifier that exists in epg_programs.
+ * Supports:
+ * - Direct matches in epg_programs (e.g. 'ch001', 'ch3447')
+ * - M3U playlist channels lookup (mapping ch.id 'ch-1' -> tvg_id 'ch001')
+ * - Aliases from XMLTV <display-name> and normalized channel names
+ * - Numeric variations (ch001, ch1, 1, 442_01)
+ * - Suffix-stripped name matching (HD, FHD, UHD, 4K, 50fps, Double, +2, +4)
  */
 export function resolveCanonicalChannelId(channelId?: string, name?: string, tvgName?: string): string {
   const db = getDb();
   if (!channelId && !name && !tvgName) return '';
 
-  const checkAlias = (term: string): string | null => {
-    if (!term) return null;
+  const hasEpg = (id: string): boolean => {
+    if (!id) return false;
+    const row = db.prepare('SELECT 1 FROM epg_programs WHERE channel_id = ? LIMIT 1').get(id);
+    return !!row;
+  };
+
+  // 1. Direct match in epg_programs
+  if (channelId && hasEpg(channelId)) {
+    return channelId;
+  }
+
+  // 2. Check channels table: find tvg_id or id that has programs
+  let chRow: any = null;
+  if (channelId) {
+    chRow = db.prepare('SELECT id, tvg_id, name, tvg_name FROM channels WHERE id = ? OR tvg_id = ? LIMIT 1').get(channelId, channelId) as any;
+    if (chRow) {
+      if (chRow.tvg_id && hasEpg(chRow.tvg_id)) return chRow.tvg_id;
+      if (chRow.id && hasEpg(chRow.id)) return chRow.id;
+    }
+  }
+
+  // 3. Collect all candidate search terms
+  const terms: string[] = [];
+  if (channelId) terms.push(channelId);
+  if (tvgName) terms.push(tvgName);
+  if (name) terms.push(name);
+  if (chRow?.tvg_id && !terms.includes(chRow.tvg_id)) terms.push(chRow.tvg_id);
+  if (chRow?.tvg_name && !terms.includes(chRow.tvg_name)) terms.push(chRow.tvg_name);
+  if (chRow?.name && !terms.includes(chRow.name)) terms.push(chRow.name);
+
+  // Check channel aliases for all terms
+  for (const term of terms) {
     const norm = normalizeName(term);
+    if (!norm) continue;
+
     const row = db.prepare('SELECT target_channel_id FROM channel_aliases WHERE alias = ? LIMIT 1').get(norm) as { target_channel_id: string } | undefined;
-    if (row?.target_channel_id) return row.target_channel_id;
+    if (row?.target_channel_id && hasEpg(row.target_channel_id)) {
+      return row.target_channel_id;
+    }
 
     const stripped = normalizeName(stripSuffixes(term));
     if (stripped && stripped !== norm) {
       const row2 = db.prepare('SELECT target_channel_id FROM channel_aliases WHERE alias = ? LIMIT 1').get(stripped) as { target_channel_id: string } | undefined;
-      if (row2?.target_channel_id) return row2.target_channel_id;
+      if (row2?.target_channel_id && hasEpg(row2.target_channel_id)) {
+        return row2.target_channel_id;
+      }
     }
-    return null;
-  };
-
-  // Direct ID check in channels table
-  if (channelId) {
-    const directRow = db.prepare('SELECT id FROM channels WHERE id = ? OR tvg_id = ? LIMIT 1').get(channelId, channelId) as { id: string } | undefined;
-    if (directRow?.id) return directRow.id;
-
-    const directEpg = db.prepare('SELECT channel_id FROM epg_programs WHERE channel_id = ? LIMIT 1').get(channelId) as { channel_id: string } | undefined;
-    if (directEpg?.channel_id) return directEpg.channel_id;
-
-    const aliasMatch = checkAlias(channelId);
-    if (aliasMatch) return aliasMatch;
   }
 
-  if (tvgName) {
-    const aliasMatch = checkAlias(tvgName);
-    if (aliasMatch) return aliasMatch;
+  // 4. Numeric variations (e.g. 'ch001' <-> 'ch1' <-> '1')
+  for (const term of terms) {
+    const numMatch = term.match(/\d+/);
+    if (numMatch) {
+      const num = parseInt(numMatch[0], 10);
+      const candidates = [
+        `ch${String(num).padStart(3, '0')}`,
+        `ch${String(num).padStart(2, '0')}`,
+        `ch${num}`,
+        String(num)
+      ];
+      for (const cand of candidates) {
+        if (hasEpg(cand)) return cand;
+      }
+    }
   }
 
-  if (name) {
-    const aliasMatch = checkAlias(name);
-    if (aliasMatch) return aliasMatch;
-  }
-
+  // 5. Fallback: return tvg_id from channels table or original channelId
+  if (chRow?.tvg_id) return chRow.tvg_id;
   return channelId || '';
 }
 
@@ -289,14 +327,23 @@ export function getChannelEpgFromDb(
     `);
     rows = stmt.all(canonicalId, startTimeMs, endTimeMs);
   } else {
-    // Query all recent and upcoming programs for this channel (-7 days to +2 days)
-    const minTime = now - 7 * 24 * 3600 * 1000;
+    // Query all recent and upcoming programs for this channel (-10 days to +2 days)
+    const minTime = now - 10 * 24 * 3600 * 1000;
     const stmt = db.prepare(`
       SELECT * FROM epg_programs 
       WHERE channel_id = ? AND end_time >= ?
       ORDER BY start_time ASC
     `);
     rows = stmt.all(canonicalId, minTime);
+
+    // If no recent rows found, try querying all available programs for this channel
+    if (rows.length === 0) {
+      rows = db.prepare(`
+        SELECT * FROM epg_programs 
+        WHERE channel_id = ? 
+        ORDER BY start_time ASC
+      `).all(canonicalId);
+    }
   }
 
   return rows.map(r => ({
@@ -370,8 +417,23 @@ export function queryDbForViewer(params: {
 
   if (params.channelId) {
     const canonical = resolveCanonicalChannelId(params.channelId);
-    whereClauses.push('channel_id = ?');
-    queryParams.push(canonical || params.channelId);
+    const candidateIds = new Set<string>();
+    if (canonical) candidateIds.add(canonical);
+    if (params.channelId) candidateIds.add(params.channelId);
+
+    const ch = db.prepare('SELECT id, tvg_id FROM channels WHERE id = ? OR tvg_id = ? LIMIT 1').get(params.channelId, params.channelId) as any;
+    if (ch?.tvg_id) candidateIds.add(ch.tvg_id);
+    if (ch?.id) candidateIds.add(ch.id);
+
+    const idList = Array.from(candidateIds);
+    if (idList.length === 1) {
+      whereClauses.push('channel_id = ?');
+      queryParams.push(idList[0]);
+    } else {
+      const placeholders = idList.map(() => '?').join(', ');
+      whereClauses.push(`channel_id IN (${placeholders})`);
+      queryParams.push(...idList);
+    }
   }
 
   if (params.dayOffset !== undefined) {
