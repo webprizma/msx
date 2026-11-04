@@ -60,7 +60,12 @@ function initTables(db: Database.Database) {
       category TEXT,
       description TEXT,
       start_time INTEGER NOT NULL,
-      end_time INTEGER NOT NULL
+      end_time INTEGER NOT NULL,
+      rating TEXT,
+      year TEXT,
+      country TEXT,
+      sub_title TEXT,
+      poster TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_epg_lookup ON epg_programs(channel_id, start_time, end_time);
@@ -73,6 +78,13 @@ function initTables(db: Database.Database) {
       updated_at INTEGER NOT NULL
     );
   `);
+
+  // Non-destructive column additions for existing databases
+  for (const col of ['rating', 'year', 'country', 'sub_title', 'poster']) {
+    try {
+      db.exec(`ALTER TABLE epg_programs ADD COLUMN ${col} TEXT;`);
+    } catch {}
+  }
 }
 
 export function normalizeName(name: string): string {
@@ -354,6 +366,11 @@ export function getChannelEpgFromDb(
     category: r.category || 'ТВ',
     start: r.start_time,
     end: r.end_time,
+    rating: r.rating || undefined,
+    year: r.year || undefined,
+    country: r.country || undefined,
+    subTitle: r.sub_title || undefined,
+    poster: r.poster || undefined,
     isLive: now >= r.start_time && now < r.end_time,
     hasArchive: r.end_time <= now
   }));
@@ -475,6 +492,11 @@ export function queryDbForViewer(params: {
     category: r.category,
     start: r.start_time,
     end: r.end_time,
+    rating: r.rating || undefined,
+    year: r.year || undefined,
+    country: r.country || undefined,
+    subTitle: r.sub_title || undefined,
+    poster: r.poster || undefined,
     isLive: now >= r.start_time && now < r.end_time,
     hasArchive: r.end_time <= now
   }));
@@ -499,14 +521,26 @@ export function createEpgStreamWriter() {
       category TEXT,
       description TEXT,
       start_time INTEGER NOT NULL,
-      end_time INTEGER NOT NULL
+      end_time INTEGER NOT NULL,
+      rating TEXT,
+      year TEXT,
+      country TEXT,
+      sub_title TEXT,
+      poster TEXT
     );
     DELETE FROM epg_staging;
   `);
 
+  for (const col of ['rating', 'year', 'country', 'sub_title', 'poster']) {
+    try {
+      db.exec(`ALTER TABLE epg_staging ADD COLUMN ${col} TEXT;`);
+    } catch {}
+  }
+
   const insertProgStmt = db.prepare(`
-    INSERT OR REPLACE INTO epg_staging (id, channel_id, title, category, description, start_time, end_time)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT OR REPLACE INTO epg_staging (
+      id, channel_id, title, category, description, start_time, end_time, rating, year, country, sub_title, poster
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const insertAliasStmt = db.prepare(`
@@ -521,7 +555,7 @@ export function createEpgStreamWriter() {
   const flush = db.transaction(() => {
     for (let i = 0; i < progBatch.length; i++) {
       const p = progBatch[i];
-      insertProgStmt.run(p[0], p[1], p[2], p[3], p[4], p[5], p[6]);
+      insertProgStmt.run(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]);
     }
     progBatch = [];
 
@@ -533,8 +567,24 @@ export function createEpgStreamWriter() {
   });
 
   return {
-    addProgram(id: string, channelId: string, title: string, category: string, description: string, start: number, end: number) {
-      progBatch.push([id, channelId, title, category, description, start, end]);
+    addProgram(
+      id: string,
+      channelId: string,
+      title: string,
+      category: string,
+      description: string,
+      start: number,
+      end: number,
+      rating?: string,
+      year?: string,
+      country?: string,
+      subTitle?: string,
+      poster?: string
+    ) {
+      progBatch.push([
+        id, channelId, title, category, description, start, end,
+        rating || null, year || null, country || null, subTitle || null, poster || null
+      ]);
       count++;
       if (progBatch.length >= 1000) {
         flush();

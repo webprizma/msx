@@ -20,6 +20,11 @@ export interface EpgProgram {
   category?: string;
   start: number; // Unix timestamp in ms
   end: number;   // Unix timestamp in ms
+  rating?: string;
+  year?: string;
+  country?: string;
+  subTitle?: string;
+  poster?: string;
   isLive?: boolean;
   hasArchive?: boolean;
   archiveUrl?: string;

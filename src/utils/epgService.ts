@@ -56,7 +56,21 @@ function decodeXmlEntities(str: string): string {
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&#039;/g, "'");
+    .replace(/&#039;/g, "'")
+    .replace(/&#(\d+);/g, (_, dec) => {
+      try {
+        return String.fromCharCode(parseInt(dec, 10));
+      } catch {
+        return _;
+      }
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+      try {
+        return String.fromCharCode(parseInt(hex, 16));
+      } catch {
+        return _;
+      }
+    });
 }
 
 function normalizeName(name: string): string {
@@ -193,16 +207,39 @@ async function parseEpgFromStreamDirectToDb(
       if (!start || !end) continue;
 
       const titleMatch = inner.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      const subTitleMatch = inner.match(/<sub-title[^>]*>([\s\S]*?)<\/sub-title>/i);
       const descMatch = inner.match(/<desc[^>]*>([\s\S]*?)<\/desc>/i);
       const catMatch = inner.match(/<category[^>]*>([\s\S]*?)<\/category>/i);
+      const countryMatch = inner.match(/<country[^>]*>([^<]+)<\/country>/i);
+      const dateMatch = inner.match(/<date[^>]*>(\d{4})<\/date>/i);
+      const ratingMatch = inner.match(/<rating[^>]*>[\s\S]*?<value>([^<]+)<\/value>[\s\S]*?<\/rating>/i);
+      const iconMatch = inner.match(/<icon[^>]+src="([^"]+)"/i);
 
       const title = decodeXmlEntities(titleMatch ? titleMatch[1].trim() : 'Передача');
+      const subTitle = subTitleMatch ? decodeXmlEntities(subTitleMatch[1].trim()) : undefined;
       const rawDesc = decodeXmlEntities(descMatch ? descMatch[1].trim() : '');
-      const desc = rawDesc.length > 250 ? rawDesc.slice(0, 250) + '...' : rawDesc;
+      const desc = rawDesc.length > 2500 ? rawDesc.slice(0, 2500) + '...' : rawDesc;
       const category = decodeXmlEntities(catMatch ? catMatch[1].trim() : 'ТВ');
+      const country = countryMatch ? decodeXmlEntities(countryMatch[1].trim()) : undefined;
+      const year = dateMatch ? dateMatch[1].trim() : undefined;
+      const rating = ratingMatch ? decodeXmlEntities(ratingMatch[1].trim()) : undefined;
+      const poster = iconMatch ? iconMatch[1].trim() : undefined;
 
       // Write directly to SQLite staging table batch (flushes every 1,000 rows)
-      writer.addProgram(`epg-${chId}-${start}`, chId, title, category, desc, start, end);
+      writer.addProgram(
+        `epg-${chId}-${start}`,
+        chId,
+        title,
+        category,
+        desc,
+        start,
+        end,
+        rating,
+        year,
+        country,
+        subTitle,
+        poster
+      );
     }
 
     // Immediately truncate buffer so memory stays below 50 KB!
