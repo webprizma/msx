@@ -87,8 +87,8 @@ function deduplicateClientEpg(programs: EpgProgram[]): EpgProgram[] {
     }
 
     const prev = result[result.length - 1];
-    const sameStart = Math.abs(cleanProg.start - prev.start) < 90000;
-    const sameEnd = Math.abs(cleanProg.end - prev.end) < 90000;
+    const sameStart = Math.abs(cleanProg.start - prev.start) < 60000;
+    const sameEnd = Math.abs(cleanProg.end - prev.end) < 60000;
     const prevNorm = prev.title.toLowerCase().replace(/[\s\-_!?:.,/\\()[\]]+/g, '');
     const progNorm = cleanProg.title.toLowerCase().replace(/[\s\-_!?:.,/\\()[\]]+/g, '');
     const sameTitle =
@@ -96,7 +96,8 @@ function deduplicateClientEpg(programs: EpgProgram[]): EpgProgram[] {
       (prevNorm.length > 5 && progNorm.includes(prevNorm)) ||
       (progNorm.length > 5 && prevNorm.includes(progNorm));
 
-    const isDuplicate = sameStart || (sameEnd && sameTitle) || (sameTitle && cleanProg.start < prev.end);
+    // ONLY consider duplicate if titles match or if IDs are identical
+    const isDuplicate = (cleanProg.id === prev.id) || (sameTitle && (sameStart || sameEnd || cleanProg.start < prev.end));
 
     if (isDuplicate) {
       const prevDesc = (prev.description || '').trim();
@@ -290,12 +291,28 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       const res = await fetch('/api/iptv/epg/live');
       if (res.ok) {
         const data = await res.json();
-        if (data && typeof data === 'object') {
+        if (data && typeof data === 'object' && Object.keys(data).length > 0) {
           setLiveProgramsMap(data);
+          return;
+        }
+      }
+      if (channels.length > 0) {
+        const postRes = await fetch('/api/iptv/epg/live', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            channels: channels.map(c => ({ id: c.id, name: c.name, tvgId: c.tvgId, tvgName: c.tvgName }))
+          })
+        });
+        if (postRes.ok) {
+          const postData = await postRes.json();
+          if (postData && typeof postData === 'object') {
+            setLiveProgramsMap(postData);
+          }
         }
       }
     } catch {}
-  }, []);
+  }, [channels]);
 
   useEffect(() => {
     refreshLivePrograms();
@@ -366,12 +383,12 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
   // Filter EPG by selected day (0 = today, -1 = yesterday, +1 = tomorrow, etc.) in Moscow Time
   const filteredEpg = useMemo(() => {
     const tzOffsetMs = 3 * 3600 * 1000;
-    const nowInMsk = new Date(Date.now() + tzOffsetMs);
-    const targetInMsk = new Date(nowInMsk);
-    targetInMsk.setUTCDate(targetInMsk.getUTCDate() + selectedDayOffset);
-    targetInMsk.setUTCHours(0, 0, 0, 0);
+    const nowMsk = new Date(Date.now() + tzOffsetMs);
+    const mskYear = nowMsk.getUTCFullYear();
+    const mskMonth = nowMsk.getUTCMonth();
+    const mskDate = nowMsk.getUTCDate() + selectedDayOffset;
 
-    const dayStartUtc = targetInMsk.getTime() - tzOffsetMs;
+    const dayStartUtc = Date.UTC(mskYear, mskMonth, mskDate, 0, 0, 0) - tzOffsetMs;
     const dayEndUtc = dayStartUtc + 24 * 3600 * 1000;
 
     // Show any program that overlaps with this day, deduplicated with descriptions prioritized
@@ -579,22 +596,20 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             // Auto-check: if no programs overlap current selectedDayOffset, align to closest day with programs
             if (!isArchiveMode) {
               const tzOffsetMs = 3 * 3600 * 1000;
-              const nowInMsk = new Date(Date.now() + tzOffsetMs);
+              const nowMsk = new Date(Date.now() + tzOffsetMs);
+              const mskYear = nowMsk.getUTCFullYear();
+              const mskMonth = nowMsk.getUTCMonth();
+              const mskDate = nowMsk.getUTCDate();
+
               const hasProgramsForCurrentDay = programs.some(p => {
-                const targetInMsk = new Date(nowInMsk);
-                targetInMsk.setUTCDate(targetInMsk.getUTCDate() + selectedDayOffset);
-                targetInMsk.setUTCHours(0, 0, 0, 0);
-                const start = targetInMsk.getTime() - tzOffsetMs;
+                const start = Date.UTC(mskYear, mskMonth, mskDate + selectedDayOffset, 0, 0, 0) - tzOffsetMs;
                 const end = start + 24 * 3600 * 1000;
                 return p.end > start && p.start < end;
               });
 
               if (!hasProgramsForCurrentDay) {
                 for (const off of [0, -1, 1, -2, -3, -4, -5, -6, -7]) {
-                  const targetInMsk = new Date(nowInMsk);
-                  targetInMsk.setUTCDate(targetInMsk.getUTCDate() + off);
-                  targetInMsk.setUTCHours(0, 0, 0, 0);
-                  const s = targetInMsk.getTime() - tzOffsetMs;
+                  const s = Date.UTC(mskYear, mskMonth, mskDate + off, 0, 0, 0) - tzOffsetMs;
                   const e = s + 24 * 3600 * 1000;
                   if (programs.some(p => p.end > s && p.start < e)) {
                     setSelectedDayOffset(off);
@@ -1209,7 +1224,14 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             break;
 
           case 'RED':
-          case 'UP':
+          case 'GUIDE':
+            if (selectedChannel) {
+              setSelectedDayOffset(0);
+              setOverlayMode('epg');
+            }
+            break;
+
+          case 'GREEN':
             if (selectedChannel) {
               const grp = selectedChannel.group || 'Все';
               setActiveGroup(grp);
@@ -1220,21 +1242,17 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             setOverlayMode('channels');
             break;
 
-          case 'GUIDE':
           case 'YELLOW':
-            if (selectedChannel) {
-              setSelectedDayOffset(0);
-              setOverlayMode('epg');
-            }
-            break;
-
-          case 'GREEN':
             handleJumpToLive();
             showToast('● Прямой эфир');
             break;
 
-          case 'DOWN':
           case 'BLUE':
+          case 'UP':
+            // "синяя: ничего", "каналы - только зеленая, а не Вверх", "сам функционал нужно оставить только на одной кнопке"
+            break;
+
+          case 'DOWN':
             {
               const currentPos = getCurrentPlaybackTimestamp();
               setSeekTimestamp(currentPos);
@@ -1342,8 +1360,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             break;
 
           case 'OK':
-          case 'YELLOW':
-          case 'GUIDE':
+          case 'PLAY_PAUSE':
             if (filteredChannels[focusedChannelIndex]) {
               const ch = filteredChannels[focusedChannelIndex];
               if (isSameChannel(selectedChannel, ch)) {
@@ -1364,31 +1381,23 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             }
             break;
 
-          case 'GREEN':
-          case 'PLAY_PAUSE':
-            if (filteredChannels[focusedChannelIndex]) {
-              const ch = filteredChannels[focusedChannelIndex];
-              if (isSameChannel(selectedChannel, ch)) {
-                // If already playing this channel, simply return to full-screen video
-                setOverlayMode('none');
-              } else {
-                setIsArchiveMode(false);
-                archiveBaseTimestampRef.current = 0;
-                currentArchivePlaybackTimeRef.current = 0;
-                setIsStalled(false);
-                setReconnectAttempt(0);
-                setPlayerError(null);
-                setSelectedChannel(ch);
-                setSelectedDayOffset(0);
-                playStream(ch.streamUrl, false);
-                setOverlayMode('none');
-              }
-            }
+          case 'RED':
+          case 'GUIDE':
+            setOverlayMode('epg');
             break;
 
-          case 'RED':
+          case 'GREEN':
           case 'BACK':
             setOverlayMode('none');
+            break;
+
+          case 'YELLOW':
+            handleJumpToLive();
+            setOverlayMode('none');
+            showToast('● Прямой эфир');
+            break;
+
+          case 'BLUE':
             break;
         }
         return;
@@ -1448,16 +1457,22 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             }
             break;
 
+          case 'RED':
+          case 'BACK':
+            setOverlayMode('none');
+            break;
+
           case 'GREEN':
+            setOverlayMode('channels');
+            break;
+
+          case 'YELLOW':
             handleJumpToLive();
             setOverlayMode('none');
             showToast('● Прямой эфир');
             break;
 
-          case 'RED':
-          case 'BACK':
-            // Step back to channel list on the left!
-            setOverlayMode('channels');
+          case 'BLUE':
             break;
         }
         return;
@@ -1995,12 +2010,12 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             whiteSpace: 'nowrap'
           }}
         >
-          <span><span style={{ color: '#ef4444', fontWeight: 'bold' }}>● Красная</span> / ▲: Каналы</span>
-          <span><span style={{ color: '#38bdf8', fontWeight: 'bold' }}>ОК</span> / ▶: Пауза</span>
-          <span>▼ / <span style={{ color: '#60a5fa', fontWeight: 'bold' }}>● Синяя</span>: Таймлайн</span>
-          <span>◄ ►: Перемотка</span>
-          <span><span style={{ color: '#eab308', fontWeight: 'bold' }}>● Желтая</span> / EPG: Программа</span>
-          <span><span style={{ color: '#22c55e', fontWeight: 'bold' }}>● Зеленая</span>: Эфир</span>
+          <span><span style={{ color: '#ef4444', fontWeight: 'bold' }}>● Красная:</span> EPG/программа передач</span>
+          <span><span style={{ color: '#22c55e', fontWeight: 'bold' }}>● Зеленая:</span> Каналы</span>
+          <span><span style={{ color: '#eab308', fontWeight: 'bold' }}>● Желтая:</span> Прямой эфир</span>
+          <span><span style={{ color: '#38bdf8', fontWeight: 'bold' }}>ОК:</span> Пауза</span>
+          <span><span style={{ color: '#94a3b8', fontWeight: 'bold' }}>▼:</span> Таймлайн</span>
+          <span><span style={{ color: '#94a3b8', fontWeight: 'bold' }}>◄ ►:</span> Перемотка</span>
         </div>
       )}
 
@@ -2264,27 +2279,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               })}
             </div>
           </div>
-
-          {/* Footer Hints */}
-          <div
-            style={{
-              padding: '12px 16px',
-              backgroundColor: 'rgba(15, 23, 42, 0.98)',
-              borderTop: '1px solid rgba(51, 65, 85, 0.8)',
-              fontSize: '11px',
-              color: '#94a3b8',
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center'
-            }}
-          >
-            <span>▲▼ Каналы · ◄► Группы</span>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <span style={{ color: '#38bdf8', fontWeight: 'bold' }}>ОК / Желтая: Программа</span>
-              <span style={{ color: '#4ade80', fontWeight: 'bold' }}>Play / Зеленая: Эфир</span>
-              <span style={{ color: '#ef4444', fontWeight: 'bold' }}>Красная: Закрыть</span>
-            </div>
-          </div>
         </div>
       )}
 
@@ -2367,12 +2361,12 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           >
             {[-7, -6, -5, -4, -3, -2, -1, 0, 1].map((offset) => {
               const tzOffsetMs = 3 * 3600 * 1000;
-              const nowInMsk = new Date(Date.now() + tzOffsetMs);
-              const targetInMsk = new Date(nowInMsk);
-              targetInMsk.setUTCDate(targetInMsk.getUTCDate() + offset);
-              targetInMsk.setUTCHours(12, 0, 0, 0);
-              const d = new Date(targetInMsk.getTime() - tzOffsetMs);
-              const dayStr = d.toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow', weekday: 'short', day: 'numeric', month: 'short' });
+              const nowMsk = new Date(Date.now() + tzOffsetMs);
+              const mskYear = nowMsk.getUTCFullYear();
+              const mskMonth = nowMsk.getUTCMonth();
+              const mskDate = nowMsk.getUTCDate() + offset;
+              const d = new Date(Date.UTC(mskYear, mskMonth, mskDate, 12, 0, 0));
+              const dayStr = d.toLocaleDateString('ru-RU', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' });
 
               const label =
                 offset === 1
@@ -2472,6 +2466,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               filteredEpg.map((prog, idx) => {
                 const isFocused = focusedProgramIndex === idx;
                 const isFuture = prog.start > Date.now();
+                const hasChannelArchive = (selectedChannel?.catchupDays || 0) > 0;
                 const isCurrentlyPlaying = isArchiveMode
                   ? (currentPlayingProgram?.id === prog.id ||
                      (prog.start <= seekTimestamp && prog.end > seekTimestamp) ||
@@ -2492,6 +2487,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                         setPromptProgram(prog);
                         setPromptFocusedChoice('live');
                         setOverlayMode('prompt');
+                      } else if (!hasChannelArchive) {
+                        showToast('Канал транслируется только в прямом эфире (без архива)');
                       } else {
                         handlePlayArchiveProgram(prog, true);
                       }
@@ -2581,7 +2578,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                           >
                             СКОРО
                           </span>
-                        ) : prog.hasArchive ? (
+                        ) : (hasChannelArchive && prog.hasArchive) ? (
                           <span
                             style={{
                               fontSize: '10px',
@@ -2622,29 +2619,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
               })
             )}
           </div>
-
-          {/* Footer Hints */}
-          <div
-            style={{
-              padding: '12px 16px',
-              backgroundColor: 'rgba(15, 23, 42, 0.98)',
-              borderTop: '1px solid rgba(51, 65, 85, 0.8)',
-              fontSize: '11px',
-              color: '#94a3b8',
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center'
-            }}
-          >
-            <span>▲▼ Передачи · ◄► Дни архива</span>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <span style={{ color: '#38bdf8', fontWeight: 'bold' }}>
-                {filteredEpg.length === 0 ? 'ОК: Загрузить EPG' : 'ОК: Смотреть'}
-              </span>
-              <span style={{ color: '#ef4444', fontWeight: 'bold' }}>Красная: Каналы</span>
-              <span style={{ color: '#22c55e', fontWeight: 'bold' }}>Зеленая: Эфир</span>
-            </div>
-          </div>
         </div>
       )}
 
@@ -2674,6 +2648,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           {(() => {
             const prog = filteredEpg[focusedProgramIndex];
             const now = Date.now();
+            const hasChannelArchive = (selectedChannel?.catchupDays || 0) > 0;
             const isProgLive = now >= prog.start && now < prog.end;
             const isFuture = prog.start > now;
             const isPlayingThis = isArchiveMode
@@ -2764,7 +2739,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                       }}>
                         СКОРО
                       </span>
-                    ) : prog.hasArchive ? (
+                    ) : (hasChannelArchive && prog.hasArchive) ? (
                       <span style={{
                         fontSize: '10px',
                         fontWeight: 'bold',
@@ -2937,6 +2912,18 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                       textAlign: 'center'
                     }}>
                       ⏰ Начнётся в {formatTime(prog.start)} (Анонс)
+                    </div>
+                  ) : !hasChannelArchive ? (
+                    <div style={{
+                      flex: 1,
+                      padding: '10px 16px',
+                      borderRadius: '10px',
+                      backgroundColor: 'rgba(30, 41, 59, 0.8)',
+                      color: '#94a3b8',
+                      fontSize: '12px',
+                      textAlign: 'center'
+                    }}>
+                      Канал без архива (только прямой эфир)
                     </div>
                   ) : (
                     <button

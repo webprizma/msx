@@ -395,19 +395,23 @@ export function getBatchLiveProgramsFromDb(
   const liveByCanonical = new Map<string, string>();
   for (const r of rows) {
     liveByCanonical.set(r.channel_id, r.title);
+    result[r.channel_id] = r.title;
   }
 
-  for (const ch of channels) {
+  for (const ch of (channels || [])) {
     const canonical = resolveCanonicalChannelId(ch.tvgId || ch.id, ch.name, ch.tvgName);
     let title = liveByCanonical.get(canonical);
 
     if (!title && ch.id) title = liveByCanonical.get(ch.id);
     if (!title && ch.tvgId) title = liveByCanonical.get(ch.tvgId);
+    if (!title && ch.tvgName) title = liveByCanonical.get(ch.tvgName);
 
     if (title) {
-      result[ch.id] = title;
-      result[ch.name] = title;
+      if (ch.id) result[ch.id] = title;
+      if (ch.name) result[ch.name] = title;
       if (ch.tvgId) result[ch.tvgId] = title;
+      if (ch.tvgName) result[ch.tvgName] = title;
+      if (canonical) result[canonical] = title;
     }
   }
 

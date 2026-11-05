@@ -48,8 +48,16 @@ if (!iptvSettings.epgUrl || iptvSettings.epgUrl.includes('1.1.xml')) {
 const initialDbStats = getDatabaseStats();
 console.log(`[IPTV Server] SQLite DB active: ${initialDbStats.channelsCount} channels, ${initialDbStats.programsCount} programs (${(initialDbStats.dbSizeBytes / 1024 / 1024).toFixed(1)} MB).`);
 
+// BOOT CHECK: Ensure channels list from playlist is cached in SQLite
+if (initialDbStats.channelsCount === 0 && iptvSettings.playlistUrl) {
+  console.log('[IPTV Server] Channels table is empty in SQLite. Fetching playlist channels on boot...');
+  fetchAndCacheChannels(iptvSettings.playlistUrl).catch(err => {
+    console.warn('[IPTV Boot Channel Notice]:', err?.message || err);
+  });
+}
+
 // 24-HOUR EPG CHECK: If database is empty or older than 24h, run initial sync in background
-if (initialDbStats.channelsCount === 0 || !initialDbStats.isFresh) {
+if (initialDbStats.programsCount === 0 || !initialDbStats.isFresh) {
   console.log('[IPTV Server] SQLite DB is empty or older than 24h. Starting background sync into SQLite...');
   syncEpg(iptvSettings.epgUrl || 'https://rus.epg.team/7.1.xml.gz?pkg=442', true).catch(err => {
     console.warn('[EPG Background Sync Notice]:', err?.message || err);
@@ -492,14 +500,23 @@ app.post('/api/iptv/epg/sync', async (req, res) => {
 });
 
 // Live program titles for channels (fast dictionary lookup from SQLite)
-app.get('/api/iptv/epg/live', (req, res) => {
-  const channels = getAllChannelsFromDb();
+app.get('/api/iptv/epg/live', async (req, res) => {
+  let channels = getAllChannelsFromDb();
+  if (channels.length === 0 && iptvSettings.playlistUrl) {
+    channels = await fetchAndCacheChannels(iptvSettings.playlistUrl);
+  }
   const liveMap = getBatchLiveProgramsFromDb(channels);
   res.json(liveMap);
 });
 
-app.post('/api/iptv/epg/live', (req, res) => {
-  const requestedChannels = req.body?.channels || getAllChannelsFromDb();
+app.post('/api/iptv/epg/live', async (req, res) => {
+  let requestedChannels = req.body?.channels;
+  if (!Array.isArray(requestedChannels) || requestedChannels.length === 0) {
+    requestedChannels = getAllChannelsFromDb();
+    if (requestedChannels.length === 0 && iptvSettings.playlistUrl) {
+      requestedChannels = await fetchAndCacheChannels(iptvSettings.playlistUrl);
+    }
+  }
   const liveMap = getBatchLiveProgramsFromDb(requestedChannels);
   res.json(liveMap);
 });
