@@ -732,14 +732,49 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }
   }, [overlayMode]);
 
+  // Helper: calculate relative day offset (-7 to +1) for any timestamp in Moscow Time (UTC+3)
+  const getDayOffsetForTimestamp = useCallback((ts: number): number => {
+    if (!ts) return 0;
+    const tzOffsetMs = 3 * 3600 * 1000;
+    const nowMs = Date.now();
+    const nowMsk = new Date(nowMs + tzOffsetMs);
+    const todayStartUtc = Date.UTC(nowMsk.getUTCFullYear(), nowMsk.getUTCMonth(), nowMsk.getUTCDate(), 0, 0, 0) - tzOffsetMs;
+
+    const targetMsk = new Date(ts + tzOffsetMs);
+    const targetDayStartUtc = Date.UTC(targetMsk.getUTCFullYear(), targetMsk.getUTCMonth(), targetMsk.getUTCDate(), 0, 0, 0) - tzOffsetMs;
+
+    const diffDays = Math.round((targetDayStartUtc - todayStartUtc) / (24 * 3600 * 1000));
+    return Math.min(1, Math.max(-7, diffDays));
+  }, []);
+
+  // Get accurate current wall-clock playback timestamp (especially during archive playback)
+  const getCurrentPlaybackTimestamp = useCallback((): number => {
+    if (isArchiveMode) {
+      const v = videoRef.current;
+      const base = archiveBaseTimestampRef.current;
+      if (base > 0 && v && !isNaN(v.currentTime) && v.currentTime > 0) {
+        return base + Math.floor(v.currentTime * 1000);
+      }
+      if (currentArchivePlaybackTimeRef.current > 0) {
+        return currentArchivePlaybackTimeRef.current;
+      }
+      return seekTimestamp;
+    }
+    return Date.now();
+  }, [isArchiveMode, seekTimestamp]);
+
   // Calculate the target program index (current playing archive program or current live program)
   const getTargetProgramIndex = useCallback((): number => {
     if (filteredEpg.length === 0) return 0;
     const now = Date.now();
 
-    if (isArchiveMode && currentPlayingProgram) {
+    if (isArchiveMode) {
+      const currentTs = getCurrentPlaybackTimestamp();
+      const targetTs = (currentTs > 0 ? currentTs : seekTimestamp) || currentPlayingProgram?.start || 0;
       const archiveIdx = filteredEpg.findIndex(
-        p => p.id === currentPlayingProgram.id || (p.start <= seekTimestamp && p.end > seekTimestamp)
+        p => (currentPlayingProgram && p.id === currentPlayingProgram.id) ||
+             (targetTs > 0 && p.start <= targetTs && p.end > targetTs) ||
+             (currentPlayingProgram && p.title === currentPlayingProgram.title && p.start === currentPlayingProgram.start)
       );
       if (archiveIdx !== -1) return archiveIdx;
     }
@@ -752,7 +787,23 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
     }
 
     return 0;
-  }, [filteredEpg, isArchiveMode, currentPlayingProgram, seekTimestamp, selectedDayOffset]);
+  }, [filteredEpg, isArchiveMode, getCurrentPlaybackTimestamp, seekTimestamp, currentPlayingProgram, selectedDayOffset]);
+
+  // Open EPG on the appropriate day: if playing from archive, open on that archive day; otherwise on today
+  const handleOpenEpg = useCallback(() => {
+    if (!selectedChannel) return;
+    if (isArchiveMode) {
+      const currentTs = getCurrentPlaybackTimestamp();
+      const targetTs = (currentTs > 0 ? currentTs : seekTimestamp) || currentPlayingProgram?.start || Date.now();
+      const offset = getDayOffsetForTimestamp(targetTs);
+      selectedDayOffsetRef.current = offset;
+      setSelectedDayOffset(offset);
+    } else {
+      selectedDayOffsetRef.current = 0;
+      setSelectedDayOffset(0);
+    }
+    setOverlayMode('epg');
+  }, [selectedChannel, isArchiveMode, getCurrentPlaybackTimestamp, seekTimestamp, currentPlayingProgram, getDayOffsetForTimestamp]);
 
   // When opening EPG overlay, switching channels, or changing date, immediately focus & center the active program
   useEffect(() => {
@@ -782,22 +833,6 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
       };
     }
   }, [overlayMode, selectedChannel?.id, selectedDayOffset, filteredEpg.length, isLoadingEpg, getTargetProgramIndex, alignEpgList]);
-
-  // Get accurate current wall-clock playback timestamp (especially during archive playback)
-  const getCurrentPlaybackTimestamp = useCallback((): number => {
-    if (isArchiveMode) {
-      const v = videoRef.current;
-      const base = archiveBaseTimestampRef.current;
-      if (base > 0 && v && !isNaN(v.currentTime) && v.currentTime > 0) {
-        return base + Math.floor(v.currentTime * 1000);
-      }
-      if (currentArchivePlaybackTimeRef.current > 0) {
-        return currentArchivePlaybackTimeRef.current;
-      }
-      return seekTimestamp;
-    }
-    return Date.now();
-  }, [isArchiveMode, seekTimestamp]);
 
   // Helper: calculate how many seconds are currently buffered ahead of playback position
   const getBufferedAhead = (v: HTMLVideoElement | null): number => {
@@ -1226,8 +1261,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
           case 'RED':
           case 'GUIDE':
             if (selectedChannel) {
-              setSelectedDayOffset(0);
-              setOverlayMode('epg');
+              handleOpenEpg();
             }
             break;
 
@@ -1364,8 +1398,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             if (filteredChannels[focusedChannelIndex]) {
               const ch = filteredChannels[focusedChannelIndex];
               if (isSameChannel(selectedChannel, ch)) {
-                // If channel is already playing, do NOT reload stream and do NOT reset archive!
-                setOverlayMode('epg');
+                // If channel is already playing, do NOT reload stream and preserve archive day/program!
+                handleOpenEpg();
               } else {
                 setIsArchiveMode(false);
                 archiveBaseTimestampRef.current = 0;
@@ -1383,7 +1417,7 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
 
           case 'RED':
           case 'GUIDE':
-            setOverlayMode('epg');
+            handleOpenEpg();
             break;
 
           case 'GREEN':
@@ -2141,8 +2175,8 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                     onClick={() => {
                       setFocusedChannelIndex(actualIndex);
                       if (isSameChannel(selectedChannel, channel)) {
-                        // Already watching this channel: do NOT reload stream or reset archive playback!
-                        setOverlayMode('epg');
+                        // Already watching this channel: do NOT reload stream and preserve archive day/program!
+                        handleOpenEpg();
                         return;
                       }
                       setIsArchiveMode(false);
@@ -2467,9 +2501,10 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
                 const isFocused = focusedProgramIndex === idx;
                 const isFuture = prog.start > Date.now();
                 const hasChannelArchive = (selectedChannel?.catchupDays || 0) > 0;
+                const effectiveArchiveTs = (isArchiveMode ? getCurrentPlaybackTimestamp() : 0) || seekTimestamp;
                 const isCurrentlyPlaying = isArchiveMode
-                  ? (currentPlayingProgram?.id === prog.id ||
-                     (prog.start <= seekTimestamp && prog.end > seekTimestamp) ||
+                  ? ((currentPlayingProgram && prog.id === currentPlayingProgram.id) ||
+                     (effectiveArchiveTs > 0 && prog.start <= effectiveArchiveTs && prog.end > effectiveArchiveTs) ||
                      (currentPlayingProgram && prog.title === currentPlayingProgram.title && prog.start === currentPlayingProgram.start))
                   : (prog.isLive || (Date.now() >= prog.start && Date.now() < prog.end));
 
@@ -2651,8 +2686,11 @@ export const IptvPlayer: React.FC<IptvPlayerProps> = ({
             const hasChannelArchive = (selectedChannel?.catchupDays || 0) > 0;
             const isProgLive = now >= prog.start && now < prog.end;
             const isFuture = prog.start > now;
+            const effectiveArchiveTs = (isArchiveMode ? getCurrentPlaybackTimestamp() : 0) || seekTimestamp;
             const isPlayingThis = isArchiveMode
-              ? (currentPlayingProgram?.id === prog.id || (prog.start <= seekTimestamp && prog.end > seekTimestamp))
+              ? ((currentPlayingProgram && prog.id === currentPlayingProgram.id) ||
+                 (effectiveArchiveTs > 0 && prog.start <= effectiveArchiveTs && prog.end > effectiveArchiveTs) ||
+                 (currentPlayingProgram && prog.title === currentPlayingProgram.title && prog.start === currentPlayingProgram.start))
               : isProgLive;
 
             const durationMinutes = Math.max(1, Math.round((prog.end - prog.start) / 60000));
